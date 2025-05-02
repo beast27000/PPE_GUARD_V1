@@ -1,0 +1,921 @@
+Ok ok good the bar on top is fully white so i can really like see anything as the all the page names are also white , can we make that into a mordern top bar with the elements visible as well ?
+
+also i need u to pls go ahead and introduce lot more info into the about us and descrption pages 
+
+here is the code for the training :
+
+#!/usr/bin/env python3
+
+import argparse
+import time
+import numpy as np
+import cudf
+import cupy as cp
+from cuml.cluster import KMeans
+from cuml.metrics import confusion_matrix as cm_cuml
+from cuml.manifold import TSNE
+from cuml.decomposition import PCA
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import GradScaler, autocast
+from tqdm import tqdm
+from pycocotools.coco import COCO
+import psycopg2
+from datetime import datetime
+import os
+import json
+from PIL import Image
+import cv2
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report, f1_score
+from sklearn.manifold import TSNE  # CPU-based t-SNE fallback
+
+# Constants
+BASE_DIR = "/root/PPE_Detection_Project/NEW_RAPIDS"
+TRAIN_DATA_DIR = os.path.join(BASE_DIR, "train")
+TRAIN_ANN_FILE = os.path.join(TRAIN_DATA_DIR, "_annotations.coco.json")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
+PLOT_DIR = os.path.join(OUTPUT_DIR, "plots")
+METRIC_DIR = os.path.join(OUTPUT_DIR, "metrics")
+LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
+SKIPPED_IMAGES_FILE = os.path.join(OUTPUT_DIR, "skipped_images.txt")
+VIDEO_DIR = os.path.join(OUTPUT_DIR, "videos")
+
+for directory in [OUTPUT_DIR, MODEL_DIR, PLOT_DIR, METRIC_DIR, LOG_DIR, VIDEO_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PPE_ITEMS = [
+    "Hardhat", "NO-Hardhat", "Safety Vest", "NO-Safety Vest",
+    "Gloves", "NO-Gloves", "Goggles", "NO-Goggles",
+    "Mask", "NO-Mask", "Fall-Detected", "Person"
+]
+NUM_EPOCHS = 20
+BATCH_SIZE = 16  # Reduced for 8GB VRAM
+LEARNING_RATE = 0.0005
+WEIGHT_DECAY = 1e-4
+EARLY_STOPPING_PATIENCE = 5
+USE_MIXED_PRECISION = torch.cuda.is_available()
+RUN_T_SNE = False  # Disabled by default to avoid cuSOLVER issues
+
+CLASS_COLORS = sns.color_palette("husl", len(PPE_ITEMS))
+
+DB_PARAMS = {
+    "dbname": "ppe_detection",
+    "user": "postgres",
+    "password": "Calcite*1234",
+    "host": "localhost",
+    "port": "5432"
+}
+
+if torch.cuda.is_available():
+    print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA Version: {torch.version.cuda}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+def connect_db():
+    try:
+        conn = psycopg2.connect(**DB_PARAMS)
+        print(f"Connected to database: {DB_PARAMS['dbname']}")
+    except psycopg2.OperationalError as e:
+        if "database \"ppe_detection\" does not exist" in str(e):
+            temp_conn = psycopg2.connect(dbname="postgres", user=DB_PARAMS["user"], password=DB_PARAMS["password"], host=DB_PARAMS["host"], port=DB_PARAMS["port"])
+            temp_conn.autocommit = True
+            with temp_conn.cursor() as cur:
+                cur.execute("CREATE DATABASE ppe_detection;")
+            temp_conn.close()
+            conn = psycopg2.connect(**DB_PARAMS)
+            print("Created database 'ppe_detection' and connected.")
+        else:
+            print(f"Database connection failed: {e}")
+            return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = 'public' 
+                AND table_name = 'training_logs' 
+                AND column_name = 'model_name';
+            """)
+            if not cur.fetchone():
+                print("Table 'training_logs' missing 'model_name' or doesn't exist. Dropping and recreating...")
+                cur.execute("DROP TABLE IF EXISTS training_logs;")
+                cur.execute("""
+                    CREATE TABLE training_logs (
+                        id SERIAL PRIMARY KEY,
+                        model_name VARCHAR(50),
+                        epoch INT,
+                        loss FLOAT,
+                        accuracy FLOAT,
+                        f1_score FLOAT,
+                        class_accuracies JSON,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                print("Created 'training_logs' table.")
+            else:
+                print("Table 'training_logs' exists with 'model_name' column.")
+        conn.commit()
+        return conn
+    except psycopg2.Error as e:
+        print(f"Failed to verify or create table: {e}")
+        conn.rollback()
+        return None
+
+def log_training_metrics(conn, model_name, epoch, loss, accuracy, f1, class_accuracies=None):
+    if conn is None:
+        print("No database connection. Skipping metrics logging.")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO training_logs (model_name, epoch, loss, accuracy, f1_score, class_accuracies) VALUES (%s, %s, %s, %s, %s, %s)",
+                (model_name, epoch, float(loss), float(accuracy), float(f1), json.dumps(class_accuracies) if class_accuracies else None)
+            )
+        conn.commit()
+        print(f"Logged metrics for {model_name}, epoch {epoch}.")
+    except psycopg2.Error as e:
+        print(f"Failed to log metrics: {e}")
+        conn.rollback()
+
+class CUDATransform:
+    def __init__(self, standard_transform):
+        self.standard_transform = standard_transform
+    def __call__(self, img):
+        tensor = self.standard_transform(img)
+        return tensor
+
+class CocoDataset(Dataset):
+    def __init__(self, coco, data_dir, transform=None, phase='train', target_class=None):
+        self.coco = coco
+        self.data_dir = data_dir
+        self.transform = transform
+        self.phase = phase
+        self.target_class = target_class
+        self.ppe_map = {name: idx for idx, name in enumerate(PPE_ITEMS)}
+        self.img_ids = coco.getImgIds()
+        self.valid_img_ids = []
+        self.img_to_anns = {}
+        self.skipped_ids = []
+        self._filter_valid_images()
+        self.class_imgs = {cls: [] for cls in PPE_ITEMS} if not target_class else {target_class: []}
+        self.update_class_distribution()
+        print(f"Dataset Phase: {phase}, Target Class: {target_class}, Images: {len(self.valid_img_ids)} (Skipped {len(self.skipped_ids)})")
+
+    def _filter_valid_images(self):
+        print(f"Filtering {len(self.img_ids)} images for validity...")
+        excluded_filename = "US_Navy_110416-N-VL413-001_Japanese_civilian_shipyard_workers_aboard_the_nuclear-powered_aircraft_carrier_USS_George_Washington_-28CVN_73-29_move_a_mot_jpg.rf.d01541534a343898af2527637bbb4d90.jpg"
+        for img_id in self.img_ids:
+            img_info = self.coco.loadImgs([img_id])[0]
+            if img_info['file_name'] == excluded_filename:
+                print(f"Excluding image ID {img_id}: {img_info['file_name']}")
+                self.skipped_ids.append(img_id)
+                continue
+            img_path = os.path.join(self.data_dir, img_info['file_name'])
+            if not os.path.exists(img_path):
+                base_name = img_info['file_name'].split('.rf.')[0].rsplit('.', 1)[0]
+                found = False
+                for ext in ['.jpg', '.jpeg', '.png']:
+                    test_path = os.path.join(self.data_dir, base_name + ext)
+                    if os.path.exists(test_path):
+                        img_path = test_path
+                        found = True
+                        break
+                if not found:
+                    print(f"Skipping invalid image ID {img_id}: {img_info['file_name']}")
+                    self.skipped_ids.append(img_id)
+                    continue
+            self.valid_img_ids.append(img_id)
+            self.img_to_anns[img_id] = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
+        print(f"Valid images: {len(self.valid_img_ids)}, Skipped: {len(self.skipped_ids)}")
+
+    def update_class_distribution(self):
+        if not self.target_class:
+            for cls in self.class_imgs:
+                self.class_imgs[cls] = []
+            for img_id in self.valid_img_ids:
+                anns = self.img_to_anns[img_id]
+                labels = set()
+                for ann in anns:
+                    category_name = self.coco.loadCats(ann['category_id'])[0]['name']
+                    if category_name in self.ppe_map:
+                        labels.add(category_name)
+                    elif category_name in ["NO-Hardhat", "NO-Safety Vest", "NO-Gloves", "NO-Goggles", "NO-Mask"]:
+                        labels.add(category_name)
+                    elif category_name == "Fall-Detected":
+                        labels.add("Fall-Detected")
+                    elif category_name == "Person":
+                        labels.add("Person")
+                if not labels:
+                    labels.add("NO-Hardhat")
+                for label in labels:
+                    if label in self.ppe_map:
+                        self.class_imgs[label].append(img_id)
+        else:
+            target_class_id = next((cat_id for cat_id, cat in self.coco.cats.items() if cat['name'] == self.target_class), None)
+            if target_class_id:
+                for img_id in self.valid_img_ids:
+                    anns = self.img_to_anns[img_id]
+                    if any(ann['category_id'] == target_class_id for ann in anns):
+                        self.class_imgs[self.target_class].append(img_id)
+        class_counts = {cls: len(imgs) for cls, imgs in self.class_imgs.items()}
+        print(f"Class Distribution ({self.phase}): {class_counts}")
+
+    def __len__(self):
+        return len(self.valid_img_ids)
+
+    def __getitem__(self, idx):
+        img_id = self.valid_img_ids[idx]
+        img_info = self.coco.loadImgs([img_id])[0]
+        img_path = os.path.join(self.data_dir, img_info['file_name'])
+        if not os.path.exists(img_path):
+            base_name = img_info['file_name'].split('.rf.')[0].rsplit('.', 1)[0]
+            for ext in ['.jpg', '.jpeg', '.png']:
+                test_path = os.path.join(self.data_dir, base_name + ext)
+                if os.path.exists(test_path):
+                    img_path = test_path
+                    break
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        if self.target_class:
+            anns = self.img_to_anns[img_id]
+            target_class_id = next((cat_id for cat_id, cat in self.coco.cats.items() if cat['name'] == self.target_class), None)
+            label = 1 if any(ann['category_id'] == target_class_id for ann in anns) else 0
+            return image, torch.tensor(label, dtype=torch.float32)
+        else:
+            anns = self.img_to_anns[img_id]
+            labels = torch.zeros(len(PPE_ITEMS), dtype=torch.float32)
+            if anns:
+                for ann in anns:
+                    category_name = self.coco.loadCats(ann['category_id'])[0]['name']
+                    if category_name in self.ppe_map:
+                        labels[self.ppe_map[category_name]] = 1.0
+                    elif category_name in ["NO-Hardhat", "NO-Safety Vest", "NO-Gloves", "NO-Goggles", "NO-Mask"]:
+                        labels[self.ppe_map[category_name.replace("NO-", "")]] = 0.0
+                    elif category_name == "Fall-Detected":
+                        labels[self.ppe_map["Fall-Detected"]] = 1.0
+                    elif category_name == "Person":
+                        labels[self.ppe_map["Person"]] = 1.0
+            else:
+                labels[self.ppe_map["NO-Hardhat"]] = 1.0
+            return image, labels
+
+class BalancedSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset, oversample_factor=2.0):
+        self.dataset = dataset
+        self.oversample_factor = oversample_factor
+        self.class_imgs = {cls: [i for i in range(len(self.dataset.valid_img_ids)) if any(
+            self.dataset.coco.loadCats(ann['category_id'])[0]['name'] in self.dataset.ppe_map
+            for ann in self.dataset.img_to_anns[self.dataset.valid_img_ids[i]]
+        )] for cls in dataset.class_imgs.keys() if not dataset.target_class}
+        self.weights = self._calculate_weights()
+        print(f"Sampler class distribution: { {cls: len(imgs) for cls, imgs in self.class_imgs.items()} }")
+
+    def _calculate_weights(self):
+        class_counts = {cls: len(indices) for cls, indices in self.class_imgs.items()}
+        max_count = max(class_counts.values()) if class_counts else 1
+        class_weights = {cls: max(max_count / (count + 1e-6), 1e-6) for cls, count in class_counts.items()}
+        img_weights = torch.zeros(len(self.dataset.valid_img_ids))
+        for cls, indices in self.class_imgs.items():
+            for idx in indices:
+                img_weights[idx] = class_weights[cls]
+        img_weights = torch.where(img_weights == 0, torch.tensor(1e-6, dtype=img_weights.dtype), img_weights)
+        return img_weights
+
+    def __iter__(self):
+        weights = self.weights.double()
+        num_samples = int(len(self.dataset.valid_img_ids) * self.oversample_factor)
+        indices = torch.multinomial(weights, num_samples, replacement=True)
+        return iter(indices.tolist())
+
+    def __len__(self):
+        return int(len(self.dataset.valid_img_ids) * self.oversample_factor)
+
+base_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+cuda_transform = CUDATransform(base_transform)
+
+class EnhancedCustomCNN(nn.Module):
+    def __init__(self, num_classes=len(PPE_ITEMS)):
+        super(EnhancedCustomCNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.MaxPool2d(2, 2), nn.Dropout2d(0.2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.MaxPool2d(2, 2), nn.Dropout2d(0.2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.MaxPool2d(2, 2), nn.Dropout2d(0.2),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+            nn.MaxPool2d(2, 2), nn.Dropout2d(0.2)
+        )
+        self.feature_size = 256 * (224 // 16) * (224 // 16)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.feature_size, 512), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(256, num_classes if num_classes > 1 else 1)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        logits = self.classifier(x)
+        return logits, x
+
+class ModifiedResNet(nn.Module):
+    def __init__(self, num_classes=len(PPE_ITEMS)):
+        super(ModifiedResNet, self).__init__()
+        self.resnet = models.resnet18(weights="IMAGENET1K_V1")
+        self.feature_size = self.resnet.fc.in_features
+        self.resnet.fc = nn.Identity()
+        self.classifier = nn.Sequential(nn.Dropout(0.5), nn.Linear(self.feature_size, num_classes if num_classes > 1 else 1))
+
+    def forward(self, x):
+        features = self.resnet(x)
+        logits = self.classifier(features)
+        return logits, features
+
+class EfficientNetModel(nn.Module):
+    def __init__(self, num_classes=len(PPE_ITEMS)):
+        super(EfficientNetModel, self).__init__()
+        self.efficientnet = models.efficientnet_b0(weights='IMAGENET1K_V1')
+        self.feature_size = self.efficientnet.classifier[1].in_features
+        self.efficientnet.classifier = nn.Identity()
+        self.classifier = nn.Sequential(nn.Dropout(0.3), nn.Linear(self.feature_size, num_classes if num_classes > 1 else 1))
+
+    def forward(self, x):
+        features = self.efficientnet(x)
+        logits = self.classifier(features)
+        return logits, features
+
+class EnsembleModel:
+    def __init__(self, models, weights=None):
+        self.models = models
+        self.weights = weights if weights else [1/len(models)] * len(models)
+
+    def predict(self, x):
+        outputs = []
+        features_list = []
+        for i, model in enumerate(self.models):
+            model.eval()
+            with torch.no_grad():
+                logits, features = model(x)
+                outputs.append(self.weights[i] * torch.sigmoid(logits))
+                features_list.append(features)
+        ensemble_output = torch.zeros_like(outputs[0])
+        for output in outputs:
+            ensemble_output += output
+        return ensemble_output, features_list[0]
+
+def train_model(model, model_name, train_loader, criterion, optimizer, scheduler, conn,
+                device=DEVICE, epochs=NUM_EPOCHS, patience=EARLY_STOPPING_PATIENCE, target_class=None):
+    print(f"\n{'='*20} Starting {model_name} Training {'='*20}")
+    scaler = GradScaler() if USE_MIXED_PRECISION else None
+    train_losses, train_accs, train_f1s = [], [], []
+    best_train_f1 = 0
+    patience_counter = 0
+    all_features = None
+    all_labels = None
+    start_time = time.time()
+
+    model_viz_dir = os.path.join(PLOT_DIR, model_name)
+    os.makedirs(model_viz_dir, exist_ok=True)
+
+    for epoch in range(epochs):
+        print(f"\nEpoch {epoch+1}/{epochs}")
+        model.train()
+        running_loss = 0.0
+        epoch_features = []
+        epoch_labels = []
+        all_preds = []
+        all_true = []
+
+        train_pbar = tqdm(train_loader, desc=f"Training {model_name} (Epoch {epoch+1}/{epochs})")
+        for inputs, labels in train_pbar:
+            inputs, labels = inputs.to(device), labels.to(device).float()
+            optimizer.zero_grad()
+
+            if scaler:
+                with autocast(device_type=device.type):
+                    logits, features = model(inputs)
+                    if target_class:
+                        loss = criterion(logits.squeeze(), labels)
+                    else:
+                        loss = criterion(logits, labels)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits, features = model(inputs)
+                if target_class:
+                    loss = criterion(logits.squeeze(), labels)
+                else:
+                    loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+
+            running_loss += loss.item()
+            preds = (torch.sigmoid(logits if not target_class else logits.squeeze()) > 0.5).int()
+            all_preds.append(preds.cpu().numpy())
+            all_true.append(labels.cpu().numpy())
+
+            epoch_features.append(features.detach().cpu().numpy())
+            epoch_labels.append(labels.cpu().numpy())
+
+            train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+
+        train_loss = running_loss / len(train_loader)
+        all_preds = np.concatenate(all_preds, axis=0).astype(np.int32)
+        all_true = np.concatenate(all_true, axis=0).astype(np.int32)
+        correct = np.mean(all_preds == all_true) if target_class else np.all(all_preds == all_true, axis=1).mean()
+        train_f1 = f1_score(all_true, all_preds, average='binary' if target_class else 'samples')
+
+        train_losses.append(train_loss)
+        train_accs.append(correct)
+        train_f1s.append(train_f1)
+
+        cm_per_class = []
+        if not target_class:
+            for i in range(all_true.shape[1]):
+                true_1d = all_true[:, i]
+                pred_1d = all_preds[:, i]
+                cm = cm_cuml(cp.array(true_1d), cp.array(pred_1d))
+                cm_per_class.append(cp.asnumpy(cm))
+            cm = np.sum(cm_per_class, axis=0) if cm_per_class else np.zeros((2, 2))
+            class_acc = {cls: float(cp.sum((cp.array(all_preds)[:, i] == cp.array(all_true)[:, i])).item() / cp.sum(cp.array(all_true)[:, i]).item()) if cp.sum(cp.array(all_true)[:, i]) > 0 else 0.0 for i, cls in enumerate(PPE_ITEMS)}
+            class_f1 = {cls: f1_score(all_true[:, i], all_preds[:, i], average='binary') for i, cls in enumerate(PPE_ITEMS)}
+        else:
+            cm = cm_cuml(cp.array(all_true), cp.array(all_preds))
+            cm = cp.asnumpy(cm)
+            class_acc = {target_class: correct}
+            class_f1 = {target_class: train_f1}
+
+        print(f"Epoch {epoch+1}/{epochs}:")
+        print(f"  Train - Loss: {train_loss:.4f}, Accuracy: {correct:.4f}, F1: {train_f1:.4f}")
+
+        log_training_metrics(conn, model_name, epoch+1, train_loss, correct, train_f1, class_acc)
+
+        if train_f1 > best_train_f1:
+            best_train_f1 = train_f1
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_f1': train_f1,
+                'class_accuracies': class_acc,
+                'class_f1_scores': class_f1
+            }, os.path.join(MODEL_DIR, f"{model_name}_best.pt"))
+            print(f"  → New best model saved with F1 score: {train_f1:.4f}")
+            all_features = np.concatenate(epoch_features, axis=0)
+            all_labels = np.concatenate(epoch_labels, axis=0)
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+
+        scheduler.step(train_f1)
+
+    if all_features is not None and all_labels is not None and RUN_T_SNE:
+        print(f"  Computing final t-SNE projection...")
+        torch.cuda.empty_cache()
+        sample_size = min(50, len(all_features))  # Reduced to 50
+        indices = np.random.choice(len(all_features), sample_size, replace=False)
+        features = all_features[indices]
+        labels = all_labels[indices]
+
+        # Validate input
+        if np.any(np.isnan(features)) or np.any(np.isinf(features)):
+            print("  Warning: NaN or Inf values detected in features. Skipping t-SNE.")
+        else:
+            try:
+                pca = PCA(n_components=30)
+                features_reduced = pca.fit_transform(features)
+                tsne = TSNE(n_components=2, perplexity=15, n_iter=300, random_state=42, n_jobs=1)
+                tsne_result = tsne.fit_transform(features_reduced)
+                tsne_x = tsne_result[:, 0]
+                tsne_y = tsne_result[:, 1]
+                labels_np = labels if not target_class else labels.reshape(-1, 1)
+
+                plt.figure(figsize=(12, 10))
+                if not target_class:
+                    for i, label_name in enumerate(PPE_ITEMS):
+                        mask = labels_np[:, i] == 1
+                        if np.any(mask):
+                            plt.scatter(tsne_x[mask], tsne_y[mask], label=label_name, color=CLASS_COLORS[i], alpha=0.6)
+                else:
+                    plt.scatter(tsne_x, tsne_y, c=labels_np, cmap='binary', alpha=0.6)
+                    plt.colorbar(label='Presence')
+                plt.title(f'{model_name} - Final t-SNE Feature Visualization')
+                plt.xlabel('t-SNE Component 1')
+                plt.ylabel('t-SNE Component 2')
+                plt.legend() if not target_class else None
+                plt.grid(True)
+                plt.savefig(os.path.join(model_viz_dir, 'final_tsne.png'))
+                plt.close()
+
+                plt.figure(figsize=(12, 10))
+                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                           xticklabels=['Negative', 'Positive'], yticklabels=['Negative', 'Positive'])
+                plt.title(f'{model_name} - Final Confusion Matrix')
+                plt.xlabel('Predicted')
+                plt.ylabel('True')
+                plt.tight_layout()
+                plt.savefig(os.path.join(model_viz_dir, 'final_confusion.png'))
+                plt.close()
+
+                plt.figure(figsize=(12, 6))
+                plt.bar(class_f1.keys(), class_f1.values(), color=CLASS_COLORS[:len(class_f1)])
+                plt.title(f'{model_name} - Final Per-Class F1 Scores')
+                plt.xlabel('Class')
+                plt.ylabel('F1 Score')
+                plt.xticks(rotation=45)
+                plt.ylim(0, 1.0)
+                plt.tight_layout()
+                plt.savefig(os.path.join(model_viz_dir, 'final_class_f1.png'))
+                plt.close()
+            except Exception as e:
+                print(f"  Error during t-SNE visualization: {e} - Skipping t-SNE.")
+
+    checkpoint = torch.load(os.path.join(MODEL_DIR, f"{model_name}_best.pt"))
+    model.load_state_dict(checkpoint['model_state_dict'])
+    training_time = time.time() - start_time
+    print(f"\n{model_name} training completed in {training_time:.2f} seconds")
+
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 3, 1)
+    plt.plot(train_losses, 'r-')
+    plt.title(f'{model_name} - Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.grid(True)
+
+    plt.subplot(1, 3, 2)
+    plt.plot(train_accs, 'b-')
+    plt.title(f'{model_name} - Training Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.grid(True)
+
+    plt.subplot(1, 3, 3)
+    plt.plot(train_f1s, 'g-')
+    plt.title(f'{model_name} - Training F1 Score')
+    plt.xlabel('Epoch')
+    plt.ylabel('F1 Score')
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, f'{model_name}_training_curves.png'))
+    plt.close()
+
+    return {
+        'model_name': model_name,
+        'train_losses': train_losses,
+        'train_accs': train_accs,
+        'train_f1s': train_f1s,
+        'best_train_f1': best_train_f1,
+        'training_time': training_time,
+        'features': all_features,
+        'labels': all_labels,
+        'train_confusion_matrix': cm,
+        'class_accuracies': checkpoint.get('class_accuracies', {}),
+        'class_f1_scores': checkpoint.get('class_f1_scores', {})
+    }
+
+def process_realtime(model, target_class, video_path=None, fps=30):
+    cap = cv2.VideoCapture(video_path if video_path else 0)
+    if not cap.isOpened():
+        print("Error: Could not open video or webcam.")
+        return
+
+    transform = CUDATransform(transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ]))
+
+    log_file = os.path.join(LOG_DIR, f"{os.path.basename(video_path) if video_path else 'webcam'}_{target_class}_log.json")
+    flag_segments = []
+    start_time = None
+    frame_count = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_count += 1
+        input_tensor = transform(frame).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            logits, _ = model(input_tensor)
+            pred = (torch.sigmoid(logits.squeeze()) > 0.5).int().item()
+
+        current_time = frame_count / fps
+        if pred == 0:  # Target class absent
+            if start_time is None:
+                start_time = current_time
+        else:  # Target class present
+            if start_time is not None:
+                end_time = current_time
+                flag_segments.append({
+                    "start": f"{int(start_time//60):02d}:{int(start_time%60):02d}.{int((start_time%1)*1000):03d}",
+                    "end": f"{int(end_time//60):02d}:{int(end_time%60):02d}.{int((end_time%1)*1000):03d}",
+                    "missing": target_class
+                })
+                start_time = None
+
+    if start_time is not None:
+        end_time = frame_count / fps
+        flag_segments.append({
+            "start": f"{int(start_time//60):02d}:{int(start_time%60):02d}.{int((start_time%1)*1000):03d}",
+            "end": f"{int(end_time//60):02d}:{int(end_time%60):02d}.{int((end_time%1)*1000):03d}",
+            "missing": target_class
+        })
+
+    status = "accepted" if not flag_segments else "flagged"
+    log_data = {
+        "source": os.path.basename(video_path) if video_path else "webcam",
+        "target_class": target_class,
+        "status": status,
+        "flag_segments": flag_segments,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "frame_rate": fps
+    }
+
+    with open(log_file, 'w') as f:
+        json.dump(log_data, f, indent=4)
+    print(f"Processed {video_path or 'webcam'} for {target_class}. Status: {status}. Log saved to {log_file}")
+
+    cap.release()
+
+def plot_training_metrics(results_dict, save_dir=PLOT_DIR):
+    model_names = list(results_dict.keys())
+
+    plt.figure(figsize=(15, 8))
+    for name in model_names:
+        plt.plot(results_dict[name]['train_accs'], label=f"{name} (Best: {max(results_dict[name]['train_accs']):.4f})")
+    plt.title('Training Accuracy Comparison Across Models')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'accuracy_comparison.png'))
+    plt.close()
+
+    plt.figure(figsize=(15, 8))
+    for name in model_names:
+        plt.plot(results_dict[name]['train_f1s'], label=f"{name} (Best: {max(results_dict[name]['train_f1s']):.4f})")
+    plt.title('Training F1 Score Comparison Across Models')
+    plt.xlabel('Epoch')
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'f1_comparison.png'))
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    train_times = [results_dict[name]['training_time'] for name in model_names]
+    plt.bar(model_names, train_times, color=['royalblue', 'forestgreen', 'firebrick'])
+    plt.title('Training Time Comparison')
+    plt.xlabel('Model')
+    plt.ylabel('Time (seconds)')
+    for i, v in enumerate(train_times):
+        plt.text(i, v + 50, f"{v:.1f}s", ha='center')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'training_time_comparison.png'))
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    best_f1s = [results_dict[name]['best_train_f1'] for name in model_names]
+    plt.bar(model_names, best_f1s, color=['royalblue', 'forestgreen', 'firebrick'])
+    plt.title('Best F1 Score Comparison')
+    plt.xlabel('Model')
+    plt.ylabel('F1 Score')
+    plt.ylim(0, 1.0)
+    for i, v in enumerate(best_f1s):
+        plt.text(i, v + 0.02, f"{v:.4f}", ha='center')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'best_f1_comparison.png'))
+    plt.close()
+
+    plt.figure(figsize=(15, 10))
+    width = 0.25
+    x = np.arange(len(PPE_ITEMS))
+
+    for i, name in enumerate(model_names):
+        class_f1s = [results_dict[name]['class_f1_scores'].get(cls, 0) for cls in PPE_ITEMS]
+        plt.bar(x + i*width, class_f1s, width=width, label=name)
+
+    plt.xticks(x + width, PPE_ITEMS, rotation=45)
+    plt.title('Class-wise F1 Scores Across Models')
+    plt.xlabel('Class')
+    plt.ylabel('F1 Score')
+    plt.ylim(0, 1.0)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'class_f1_comparison.png'))
+    plt.close()
+
+    if len(model_names) > 1:
+        fig, axes = plt.subplots(1, len(model_names), figsize=(20, 6))
+        for i, name in enumerate(model_names):
+            cm = results_dict[name]['train_confusion_matrix']
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                       xticklabels=['Negative', 'Positive'], yticklabels=['Negative', 'Positive'], ax=axes[i])
+            axes[i].set_title(f'{name} - Confusion Matrix')
+            axes[i].set_xlabel('Predicted')
+            axes[i].set_ylabel('True')
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'confusion_matrices_comparison.png'))
+        plt.close()
+
+def visualize_combined_features(results_dict, save_dir=PLOT_DIR):
+    model_names = list(results_dict.keys())
+    fig, axes = plt.subplots(1, len(model_names), figsize=(20, 7))
+    if len(model_names) == 1:
+        axes = [axes]
+
+    for i, name in enumerate(model_names):
+        model_features = results_dict[name]['features']
+        model_labels = results_dict[name]['labels']
+
+        if len(model_features) > 0 and RUN_T_SNE:
+            sample_size = min(50, len(model_features))
+            indices = np.random.choice(len(model_features), sample_size, replace=False)
+            features = model_features[indices]
+            labels = model_labels[indices]
+
+            if np.any(np.isnan(features)) or np.any(np.isinf(features)):
+                print(f"  Warning: NaN or Inf values in {name} features. Skipping visualization.")
+            else:
+                try:
+                    pca = PCA(n_components=30)
+                    features_reduced = pca.fit_transform(features)
+                    tsne = TSNE(n_components=2, perplexity=15, n_iter=300, random_state=42, n_jobs=1)
+                    tsne_result = tsne.fit_transform(features_reduced)
+                    tsne_x = tsne_result[:, 0]
+                    tsne_y = tsne_result[:, 1]
+
+                    for j, label_name in enumerate(PPE_ITEMS):
+                        mask = labels[:, j] == 1
+                        if np.any(mask):
+                            axes[i].scatter(tsne_x[mask], tsne_y[mask],
+                                         label=label_name, color=CLASS_COLORS[j], alpha=0.6)
+
+                    axes[i].set_title(f'{name}\nFeature Space Visualization')
+                    axes[i].set_xlabel('t-SNE Component 1')
+                    axes[i].set_ylabel('t-SNE Component 2')
+                    if i == len(model_names) - 1:
+                        axes[i].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                except Exception as e:
+                    print(f"  Error during t-SNE visualization for {name}: {e}")
+                    axes[i].text(0.5, 0.5, f"Visualization failed: {str(e)}",
+                              ha='center', va='center', transform=axes[i].transAxes)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'combined_tsne_visualization.png'))
+    plt.close()
+
+    print("Skipping 3D t-SNE and cluster analysis to conserve memory.")
+
+def main():
+    parser = argparse.ArgumentParser(description="RAPIDS-accelerated PPE Detection Training and Real-time Processing")
+    parser.add_argument("--target-class", type=str, choices=PPE_ITEMS, help="Specify target class for single-object detection")
+    parser.add_argument("--video", type=str, help="Path to video file for real-time processing (optional)")
+    args = parser.parse_args()
+
+    print("\n" + "="*50)
+    print("RAPIDS-accelerated PPE Detection Training and Real-time Processing")
+    print("="*50 + "\n")
+
+    start_time = time.time()
+
+    conn = connect_db()
+
+    try:
+        print(f"\nLoading COCO dataset from {TRAIN_ANN_FILE}...")
+        coco = COCO(TRAIN_ANN_FILE)
+        if not coco.dataset or not coco.getImgIds():
+            raise ValueError(f"No images or annotations found in {TRAIN_ANN_FILE}. Verify the file exists and contains valid COCO data.")
+
+        data_dir = [TRAIN_DATA_DIR]
+
+        print(f"Categories: {len(coco.cats)}")
+        print(f"Images: {len(coco.imgs)}")
+        print(f"Annotations: {len(coco.anns)}")
+
+        class_dist = {cat['name']: len(coco.getAnnIds(catIds=cat_id))
+                     for cat_id, cat in coco.cats.items()}
+        print("Class distribution:")
+        for cls, count in class_dist.items():
+            print(f"  {cls}: {count}")
+
+        plt.figure(figsize=(12, 8))
+        plt.bar(class_dist.keys(), class_dist.values(), color=CLASS_COLORS)
+        plt.title('Class Distribution in Train Dataset')
+        plt.xlabel('Class')
+        plt.ylabel('Count')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(PLOT_DIR, 'class_distribution.png'))
+        plt.close()
+
+        print("\nCreating dataset and dataloader...")
+        train_dataset = CocoDataset(coco, TRAIN_DATA_DIR, transform=cuda_transform, phase='train', target_class=args.target_class)
+        if len(train_dataset) == 0:
+            raise ValueError(f"Dataset is empty. Verify images exist in {TRAIN_DATA_DIR} and match {TRAIN_ANN_FILE}.")
+
+        train_size = len(train_dataset)
+        train_sampler = BalancedSampler(train_dataset, oversample_factor=2.0) if not args.target_class else None
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler, shuffle=not train_sampler, num_workers=2, pin_memory=False, prefetch_factor=1)
+
+        print(f"Train dataset size: {train_size}")
+
+        print("\nInitializing models...")
+        models = {
+            'CustomCNN': EnhancedCustomCNN(num_classes=1 if args.target_class else len(PPE_ITEMS)).to(DEVICE),
+            'ResNet18': ModifiedResNet(num_classes=1 if args.target_class else len(PPE_ITEMS)).to(DEVICE),
+            'EfficientNet': EfficientNetModel(num_classes=1 if args.target_class else len(PPE_ITEMS)).to(DEVICE)
+        }
+
+        results = {}
+        for name, model in models.items():
+            print(f"\nPreparing to train {name}...")
+            criterion = nn.BCEWithLogitsLoss()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
+
+            results[name] = train_model(model, name, train_loader, criterion, optimizer, scheduler, conn, target_class=args.target_class)
+
+        print("\nGenerating comparative visualizations...")
+        plot_training_metrics(results)
+        visualize_combined_features(results)
+
+        summary = {
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:M:%S"),
+            'total_runtime': time.time() - start_time,
+            'models': list(models.keys()),
+            'training_results': {name: {'best_f1': results[name]['best_train_f1'], 'training_time': results[name]['training_time']} for name in models.keys()}
+        }
+
+        with open(os.path.join(OUTPUT_DIR, 'training_summary.json'), 'w') as f:
+            json.dump(summary, f, indent=4)
+
+        if args.video:
+            print(f"\nProcessing video: {args.video}...")
+            for name, model in models.items():
+                if args.target_class:
+                    checkpoint = torch.load(os.path.join(MODEL_DIR, f"{name}_best.pt"))
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    process_realtime(model, args.target_class, args.video)
+
+        print("\n" + "="*50)
+        print(f"Completed in {time.time() - start_time:.2f} seconds")
+        print(f"All results saved to {OUTPUT_DIR}")
+        print("="*50 + "\n")
+
+    except Exception as e:
+        print(f"\nError during execution: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if conn:
+            conn.close()
+            print("Database connection closed.")
+
+if __name__ == "__main__":
+    main()
+
+
+Pls do add some stock nvida gpu and nvdia pictures if possible over there 
+
+pls don't give admin page acess like this in top bar 
+
+
+can we put an authentication for admin page 
+
+only the password "admin123 "should work for logining into that page 
+
+also any other ui feature u think u can asdd

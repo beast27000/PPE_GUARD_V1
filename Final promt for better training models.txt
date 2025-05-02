@@ -1,0 +1,2234 @@
+Hey so this format of the training code for my ppe detection gives amazing amzing accuracy and f1 score but honestly it performs dog shit in real time senario any ideas on how to improve it ?
+
+i have spent hours and hours trying to correct the traing code , and spent 100's more training each for 2 hours each 
+
+can u make it work the way iwant it to , i think it is eoter underfitting or over fitting and tell me which godamm taining data set i use for it , i am using the 44000 imgaes on from roboflow with nearly 35000 in training 
+
+pls asses the code and get me a good performing score forget very high acurance i want real performance ( i mean still want to aim for accuracy and f1 of atleast 70 percednt or higher) 
+
+pls do use the valid dataset to pls pls validate the outputs after each training epoch pls: 
+
+here is the vaild dataset folder path :      /root/PPE_Detection_Project/NEW_RAPIDS/valid
+here is the coco anaotaions path of valid : /root/PPE_Detection_Project/NEW_RAPIDS/valid/_annotations.coco.json
+
+pls pls make something that acutally works i need to import these modules to my real time code 
+#!/usr/bin/env python3
+
+import argparse
+import time
+import numpy as np
+import cudf
+import cupy as cp
+from cuml.cluster import KMeans
+from cuml.metrics import confusion_matrix as cm_cuml
+from cuml.manifold import TSNE
+from cuml.decomposition import PCA
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import GradScaler, autocast
+from tqdm import tqdm
+from pycocotools.coco import COCO
+import psycopg2
+from datetime import datetime
+import os
+import json
+from PIL import Image
+import cv2
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report, f1_score
+from sklearn.manifold import TSNE  # CPU-based t-SNE fallback
+
+# Constants
+BASE_DIR = "/root/PPE_Detection_Project/NEW_RAPIDS"
+TRAIN_DATA_DIR = os.path.join(BASE_DIR, "train")
+TRAIN_ANN_FILE = os.path.join(TRAIN_DATA_DIR, "_annotations.coco.json")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
+PLOT_DIR = os.path.join(OUTPUT_DIR, "plots")
+METRIC_DIR = os.path.join(OUTPUT_DIR, "metrics")
+LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
+SKIPPED_IMAGES_FILE = os.path.join(OUTPUT_DIR, "skipped_images.txt")
+VIDEO_DIR = os.path.join(OUTPUT_DIR, "videos")
+
+for directory in [OUTPUT_DIR, MODEL_DIR, PLOT_DIR, METRIC_DIR, LOG_DIR, VIDEO_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PPE_ITEMS = [
+    "Hardhat", "NO-Hardhat", "Safety Vest", "NO-Safety Vest",
+    "Gloves", "NO-Gloves", "Goggles", "NO-Goggles",
+    "Mask", "NO-Mask", "Fall-Detected", "Person"
+]
+NUM_EPOCHS = 20
+BATCH_SIZE = 16  # Reduced for 8GB VRAM
+LEARNING_RATE = 0.0005
+WEIGHT_DECAY = 1e-4
+EARLY_STOPPING_PATIENCE = 5
+USE_MIXED_PRECISION = torch.cuda.is_available()
+RUN_T_SNE = False  # Disabled by default to avoid cuSOLVER issues
+
+CLASS_COLORS = sns.color_palette("husl", len(PPE_ITEMS))
+
+DB_PARAMS = {
+    "dbname": "ppe_detection",
+    "user": "postgres",
+    "password": "Calcite*1234",
+    "host": "localhost",
+    "port": "5432"
+}
+
+if torch.cuda.is_available():
+    print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA Version: {torch.version.cuda}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+def connect_db():
+    try:
+        conn = psycopg2.connect(**DB_PARAMS)
+        print(f"Connected to database: {DB_PARAMS['dbname']}")
+    except psycopg2.OperationalError as e:
+        if "database \"ppe_detection\" does not exist" in str(e):
+            temp_conn = psycopg2.connect(dbname="postgres", user=DB_PARAMS["user"], password=DB_PARAMS["password"], host=DB_PARAMS["host"], port=DB_PARAMS["port"])
+            temp_conn.autocommit = True
+            with temp_conn.cursor() as cur:
+                cur.execute("CREATE DATABASE ppe_detection;")
+            temp_conn.close()
+            conn = psycopg2.connect(**DB_PARAMS)
+            print("Created database 'ppe_detection' and connected.")
+        else:
+            print(f"Database connection failed: {e}")
+            return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = 'public' 
+                AND table_name = 'training_logs' 
+                AND column_name = 'model_name';
+            """)
+            if not cur.fetchone():
+                print("Table 'training_logs' missing 'model_name' or doesn't exist. Dropping and recreating...")
+                cur.execute("DROP TABLE IF EXISTS training_logs;")
+                cur.execute("""
+                    CREATE TABLE training_logs (
+                        id SERIAL PRIMARY KEY,
+                        model_name VARCHAR(50),
+                        epoch INT,
+                        loss FLOAT,
+                        accuracy FLOAT,
+                        f1_score FLOAT,
+                        class_accuracies JSON,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                print("Created 'training_logs' table.")
+            else:
+                print("Table 'training_logs' exists with 'model_name' column.")
+        conn.commit()
+        return conn
+    except psycopg2.Error as e:
+        print(f"Failed to verify or create table: {e}")
+        conn.rollback()
+        return None
+
+def log_training_metrics(conn, model_name, epoch, loss, accuracy, f1, class_accuracies=None):
+    if conn is None:
+        print("No database connection. Skipping metrics logging.")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO training_logs (model_name, epoch, loss, accuracy, f1_score, class_accuracies) VALUES (%s, %s, %s, %s, %s, %s)",
+                (model_name, epoch, float(loss), float(accuracy), float(f1), json.dumps(class_accuracies) if class_accuracies else None)
+            )
+        conn.commit()
+        print(f"Logged metrics for {model_name}, epoch {epoch}.")
+    except psycopg2.Error as e:
+        print(f"Failed to log metrics: {e}")
+        conn.rollback()
+
+class CUDATransform:
+    def __init__(self, standard_transform):
+        self.standard_transform = standard_transform
+    def __call__(self, img):
+        tensor = self.standard_transform(img)
+        return tensor
+
+class CocoDataset(Dataset):
+    def __init__(self, coco, data_dir, transform=None, phase='train', target_class=None):
+        self.coco = coco
+        self.data_dir = data_dir
+        self.transform = transform
+        self.phase = phase
+        self.target_class = target_class
+        self.ppe_map = {name: idx for idx, name in enumerate(PPE_ITEMS)}
+        self.img_ids = coco.getImgIds()
+        self.valid_img_ids = []
+        self.img_to_anns = {}
+        self.skipped_ids = []
+        self._filter_valid_images()
+        self.class_imgs = {cls: [] for cls in PPE_ITEMS} if not target_class else {target_class: []}
+        self.update_class_distribution()
+        print(f"Dataset Phase: {phase}, Target Class: {target_class}, Images: {len(self.valid_img_ids)} (Skipped {len(self.skipped_ids)})")
+
+    def _filter_valid_images(self):
+        print(f"Filtering {len(self.img_ids)} images for validity...")
+        excluded_filename = "US_Navy_110416-N-VL413-001_Japanese_civilian_shipyard_workers_aboard_the_nuclear-powered_aircraft_carrier_USS_George_Washington_-28CVN_73-29_move_a_mot_jpg.rf.d01541534a343898af2527637bbb4d90.jpg"
+        for img_id in self.img_ids:
+            img_info = self.coco.loadImgs([img_id])[0]
+            if img_info['file_name'] == excluded_filename:
+                print(f"Excluding image ID {img_id}: {img_info['file_name']}")
+                self.skipped_ids.append(img_id)
+                continue
+            img_path = os.path.join(self.data_dir, img_info['file_name'])
+            if not os.path.exists(img_path):
+                base_name = img_info['file_name'].split('.rf.')[0].rsplit('.', 1)[0]
+                found = False
+                for ext in ['.jpg', '.jpeg', '.png']:
+                    test_path = os.path.join(self.data_dir, base_name + ext)
+                    if os.path.exists(test_path):
+                        img_path = test_path
+                        found = True
+                        break
+                if not found:
+                    print(f"Skipping invalid image ID {img_id}: {img_info['file_name']}")
+                    self.skipped_ids.append(img_id)
+                    continue
+            self.valid_img_ids.append(img_id)
+            self.img_to_anns[img_id] = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
+        print(f"Valid images: {len(self.valid_img_ids)}, Skipped: {len(self.skipped_ids)}")
+
+    def update_class_distribution(self):
+        if not self.target_class:
+            for cls in self.class_imgs:
+                self.class_imgs[cls] = []
+            for img_id in self.valid_img_ids:
+                anns = self.img_to_anns[img_id]
+                labels = set()
+                for ann in anns:
+                    category_name = self.coco.loadCats(ann['category_id'])[0]['name']
+                    if category_name in self.ppe_map:
+                        labels.add(category_name)
+                    elif category_name in ["NO-Hardhat", "NO-Safety Vest", "NO-Gloves", "NO-Goggles", "NO-Mask"]:
+                        labels.add(category_name)
+                    elif category_name == "Fall-Detected":
+                        labels.add("Fall-Detected")
+                    elif category_name == "Person":
+                        labels.add("Person")
+                if not labels:
+                    labels.add("NO-Hardhat")
+                for label in labels:
+                    if label in self.ppe_map:
+                        self.class_imgs[label].append(img_id)
+        else:
+            target_class_id = next((cat_id for cat_id, cat in self.coco.cats.items() if cat['name'] == self.target_class), None)
+            if target_class_id:
+                for img_id in self.valid_img_ids:
+                    anns = self.img_to_anns[img_id]
+                    if any(ann['category_id'] == target_class_id for ann in anns):
+                        self.class_imgs[self.target_class].append(img_id)
+        class_counts = {cls: len(imgs) for cls, imgs in self.class_imgs.items()}
+        print(f"Class Distribution ({self.phase}): {class_counts}")
+
+    def __len__(self):
+        return len(self.valid_img_ids)
+
+    def __getitem__(self, idx):
+        img_id = self.valid_img_ids[idx]
+        img_info = self.coco.loadImgs([img_id])[0]
+        img_path = os.path.join(self.data_dir, img_info['file_name'])
+        if not os.path.exists(img_path):
+            base_name = img_info['file_name'].split('.rf.')[0].rsplit('.', 1)[0]
+            for ext in ['.jpg', '.jpeg', '.png']:
+                test_path = os.path.join(self.data_dir, base_name + ext)
+                if os.path.exists(test_path):
+                    img_path = test_path
+                    break
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        if self.target_class:
+            anns = self.img_to_anns[img_id]
+            target_class_id = next((cat_id for cat_id, cat in self.coco.cats.items() if cat['name'] == self.target_class), None)
+            label = 1 if any(ann['category_id'] == target_class_id for ann in anns) else 0
+            return image, torch.tensor(label, dtype=torch.float32)
+        else:
+            anns = self.img_to_anns[img_id]
+            labels = torch.zeros(len(PPE_ITEMS), dtype=torch.float32)
+            if anns:
+                for ann in anns:
+                    category_name = self.coco.loadCats(ann['category_id'])[0]['name']
+                    if category_name in self.ppe_map:
+                        labels[self.ppe_map[category_name]] = 1.0
+                    elif category_name in ["NO-Hardhat", "NO-Safety Vest", "NO-Gloves", "NO-Goggles", "NO-Mask"]:
+                        labels[self.ppe_map[category_name.replace("NO-", "")]] = 0.0
+                    elif category_name == "Fall-Detected":
+                        labels[self.ppe_map["Fall-Detected"]] = 1.0
+                    elif category_name == "Person":
+                        labels[self.ppe_map["Person"]] = 1.0
+            else:
+                labels[self.ppe_map["NO-Hardhat"]] = 1.0
+            return image, labels
+
+class BalancedSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset, oversample_factor=2.0):
+        self.dataset = dataset
+        self.oversample_factor = oversample_factor
+        self.class_imgs = {cls: [i for i in range(len(self.dataset.valid_img_ids)) if any(
+            self.dataset.coco.loadCats(ann['category_id'])[0]['name'] in self.dataset.ppe_map
+            for ann in self.dataset.img_to_anns[self.dataset.valid_img_ids[i]]
+        )] for cls in dataset.class_imgs.keys() if not dataset.target_class}
+        self.weights = self._calculate_weights()
+        print(f"Sampler class distribution: { {cls: len(imgs) for cls, imgs in self.class_imgs.items()} }")
+
+    def _calculate_weights(self):
+        class_counts = {cls: len(indices) for cls, indices in self.class_imgs.items()}
+        max_count = max(class_counts.values()) if class_counts else 1
+        class_weights = {cls: max(max_count / (count + 1e-6), 1e-6) for cls, count in class_counts.items()}
+        img_weights = torch.zeros(len(self.dataset.valid_img_ids))
+        for cls, indices in self.class_imgs.items():
+            for idx in indices:
+                img_weights[idx] = class_weights[cls]
+        img_weights = torch.where(img_weights == 0, torch.tensor(1e-6, dtype=img_weights.dtype), img_weights)
+        return img_weights
+
+    def __iter__(self):
+        weights = self.weights.double()
+        num_samples = int(len(self.dataset.valid_img_ids) * self.oversample_factor)
+        indices = torch.multinomial(weights, num_samples, replacement=True)
+        return iter(indices.tolist())
+
+    def __len__(self):
+        return int(len(self.dataset.valid_img_ids) * self.oversample_factor)
+
+base_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+cuda_transform = CUDATransform(base_transform)
+
+class EnhancedCustomCNN(nn.Module):
+    def __init__(self, num_classes=len(PPE_ITEMS)):
+        super(EnhancedCustomCNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.MaxPool2d(2, 2), nn.Dropout2d(0.2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.MaxPool2d(2, 2), nn.Dropout2d(0.2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.MaxPool2d(2, 2), nn.Dropout2d(0.2),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+            nn.MaxPool2d(2, 2), nn.Dropout2d(0.2)
+        )
+        self.feature_size = 256 * (224 // 16) * (224 // 16)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.feature_size, 512), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(256, num_classes if num_classes > 1 else 1)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        logits = self.classifier(x)
+        return logits, x
+
+class ModifiedResNet(nn.Module):
+    def __init__(self, num_classes=len(PPE_ITEMS)):
+        super(ModifiedResNet, self).__init__()
+        self.resnet = models.resnet18(weights="IMAGENET1K_V1")
+        self.feature_size = self.resnet.fc.in_features
+        self.resnet.fc = nn.Identity()
+        self.classifier = nn.Sequential(nn.Dropout(0.5), nn.Linear(self.feature_size, num_classes if num_classes > 1 else 1))
+
+    def forward(self, x):
+        features = self.resnet(x)
+        logits = self.classifier(features)
+        return logits, features
+
+class EfficientNetModel(nn.Module):
+    def __init__(self, num_classes=len(PPE_ITEMS)):
+        super(EfficientNetModel, self).__init__()
+        self.efficientnet = models.efficientnet_b0(weights='IMAGENET1K_V1')
+        self.feature_size = self.efficientnet.classifier[1].in_features
+        self.efficientnet.classifier = nn.Identity()
+        self.classifier = nn.Sequential(nn.Dropout(0.3), nn.Linear(self.feature_size, num_classes if num_classes > 1 else 1))
+
+    def forward(self, x):
+        features = self.efficientnet(x)
+        logits = self.classifier(features)
+        return logits, features
+
+class EnsembleModel:
+    def __init__(self, models, weights=None):
+        self.models = models
+        self.weights = weights if weights else [1/len(models)] * len(models)
+
+    def predict(self, x):
+        outputs = []
+        features_list = []
+        for i, model in enumerate(self.models):
+            model.eval()
+            with torch.no_grad():
+                logits, features = model(x)
+                outputs.append(self.weights[i] * torch.sigmoid(logits))
+                features_list.append(features)
+        ensemble_output = torch.zeros_like(outputs[0])
+        for output in outputs:
+            ensemble_output += output
+        return ensemble_output, features_list[0]
+
+def train_model(model, model_name, train_loader, criterion, optimizer, scheduler, conn,
+                device=DEVICE, epochs=NUM_EPOCHS, patience=EARLY_STOPPING_PATIENCE, target_class=None):
+    print(f"\n{'='*20} Starting {model_name} Training {'='*20}")
+    scaler = GradScaler() if USE_MIXED_PRECISION else None
+    train_losses, train_accs, train_f1s = [], [], []
+    best_train_f1 = 0
+    patience_counter = 0
+    all_features = None
+    all_labels = None
+    start_time = time.time()
+
+    model_viz_dir = os.path.join(PLOT_DIR, model_name)
+    os.makedirs(model_viz_dir, exist_ok=True)
+
+    for epoch in range(epochs):
+        print(f"\nEpoch {epoch+1}/{epochs}")
+        model.train()
+        running_loss = 0.0
+        epoch_features = []
+        epoch_labels = []
+        all_preds = []
+        all_true = []
+
+        train_pbar = tqdm(train_loader, desc=f"Training {model_name} (Epoch {epoch+1}/{epochs})")
+        for inputs, labels in train_pbar:
+            inputs, labels = inputs.to(device), labels.to(device).float()
+            optimizer.zero_grad()
+
+            if scaler:
+                with autocast(device_type=device.type):
+                    logits, features = model(inputs)
+                    if target_class:
+                        loss = criterion(logits.squeeze(), labels)
+                    else:
+                        loss = criterion(logits, labels)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits, features = model(inputs)
+                if target_class:
+                    loss = criterion(logits.squeeze(), labels)
+                else:
+                    loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+
+            running_loss += loss.item()
+            preds = (torch.sigmoid(logits if not target_class else logits.squeeze()) > 0.5).int()
+            all_preds.append(preds.cpu().numpy())
+            all_true.append(labels.cpu().numpy())
+
+            epoch_features.append(features.detach().cpu().numpy())
+            epoch_labels.append(labels.cpu().numpy())
+
+            train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+
+        train_loss = running_loss / len(train_loader)
+        all_preds = np.concatenate(all_preds, axis=0).astype(np.int32)
+        all_true = np.concatenate(all_true, axis=0).astype(np.int32)
+        correct = np.mean(all_preds == all_true) if target_class else np.all(all_preds == all_true, axis=1).mean()
+        train_f1 = f1_score(all_true, all_preds, average='binary' if target_class else 'samples')
+
+        train_losses.append(train_loss)
+        train_accs.append(correct)
+        train_f1s.append(train_f1)
+
+        cm_per_class = []
+        if not target_class:
+            for i in range(all_true.shape[1]):
+                true_1d = all_true[:, i]
+                pred_1d = all_preds[:, i]
+                cm = cm_cuml(cp.array(true_1d), cp.array(pred_1d))
+                cm_per_class.append(cp.asnumpy(cm))
+            cm = np.sum(cm_per_class, axis=0) if cm_per_class else np.zeros((2, 2))
+            class_acc = {cls: float(cp.sum((cp.array(all_preds)[:, i] == cp.array(all_true)[:, i])).item() / cp.sum(cp.array(all_true)[:, i]).item()) if cp.sum(cp.array(all_true)[:, i]) > 0 else 0.0 for i, cls in enumerate(PPE_ITEMS)}
+            class_f1 = {cls: f1_score(all_true[:, i], all_preds[:, i], average='binary') for i, cls in enumerate(PPE_ITEMS)}
+        else:
+            cm = cm_cuml(cp.array(all_true), cp.array(all_preds))
+            cm = cp.asnumpy(cm)
+            class_acc = {target_class: correct}
+            class_f1 = {target_class: train_f1}
+
+        print(f"Epoch {epoch+1}/{epochs}:")
+        print(f"  Train - Loss: {train_loss:.4f}, Accuracy: {correct:.4f}, F1: {train_f1:.4f}")
+
+        log_training_metrics(conn, model_name, epoch+1, train_loss, correct, train_f1, class_acc)
+
+        if train_f1 > best_train_f1:
+            best_train_f1 = train_f1
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_f1': train_f1,
+                'class_accuracies': class_acc,
+                'class_f1_scores': class_f1
+            }, os.path.join(MODEL_DIR, f"{model_name}_best.pt"))
+            print(f"  → New best model saved with F1 score: {train_f1:.4f}")
+            all_features = np.concatenate(epoch_features, axis=0)
+            all_labels = np.concatenate(epoch_labels, axis=0)
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+
+        scheduler.step(train_f1)
+
+    if all_features is not None and all_labels is not None and RUN_T_SNE:
+        print(f"  Computing final t-SNE projection...")
+        torch.cuda.empty_cache()
+        sample_size = min(50, len(all_features))  # Reduced to 50
+        indices = np.random.choice(len(all_features), sample_size, replace=False)
+        features = all_features[indices]
+        labels = all_labels[indices]
+
+        # Validate input
+        if np.any(np.isnan(features)) or np.any(np.isinf(features)):
+            print("  Warning: NaN or Inf values detected in features. Skipping t-SNE.")
+        else:
+            try:
+                pca = PCA(n_components=30)
+                features_reduced = pca.fit_transform(features)
+                tsne = TSNE(n_components=2, perplexity=15, n_iter=300, random_state=42, n_jobs=1)
+                tsne_result = tsne.fit_transform(features_reduced)
+                tsne_x = tsne_result[:, 0]
+                tsne_y = tsne_result[:, 1]
+                labels_np = labels if not target_class else labels.reshape(-1, 1)
+
+                plt.figure(figsize=(12, 10))
+                if not target_class:
+                    for i, label_name in enumerate(PPE_ITEMS):
+                        mask = labels_np[:, i] == 1
+                        if np.any(mask):
+                            plt.scatter(tsne_x[mask], tsne_y[mask], label=label_name, color=CLASS_COLORS[i], alpha=0.6)
+                else:
+                    plt.scatter(tsne_x, tsne_y, c=labels_np, cmap='binary', alpha=0.6)
+                    plt.colorbar(label='Presence')
+                plt.title(f'{model_name} - Final t-SNE Feature Visualization')
+                plt.xlabel('t-SNE Component 1')
+                plt.ylabel('t-SNE Component 2')
+                plt.legend() if not target_class else None
+                plt.grid(True)
+                plt.savefig(os.path.join(model_viz_dir, 'final_tsne.png'))
+                plt.close()
+
+                plt.figure(figsize=(12, 10))
+                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                           xticklabels=['Negative', 'Positive'], yticklabels=['Negative', 'Positive'])
+                plt.title(f'{model_name} - Final Confusion Matrix')
+                plt.xlabel('Predicted')
+                plt.ylabel('True')
+                plt.tight_layout()
+                plt.savefig(os.path.join(model_viz_dir, 'final_confusion.png'))
+                plt.close()
+
+                plt.figure(figsize=(12, 6))
+                plt.bar(class_f1.keys(), class_f1.values(), color=CLASS_COLORS[:len(class_f1)])
+                plt.title(f'{model_name} - Final Per-Class F1 Scores')
+                plt.xlabel('Class')
+                plt.ylabel('F1 Score')
+                plt.xticks(rotation=45)
+                plt.ylim(0, 1.0)
+                plt.tight_layout()
+                plt.savefig(os.path.join(model_viz_dir, 'final_class_f1.png'))
+                plt.close()
+            except Exception as e:
+                print(f"  Error during t-SNE visualization: {e} - Skipping t-SNE.")
+
+    checkpoint = torch.load(os.path.join(MODEL_DIR, f"{model_name}_best.pt"))
+    model.load_state_dict(checkpoint['model_state_dict'])
+    training_time = time.time() - start_time
+    print(f"\n{model_name} training completed in {training_time:.2f} seconds")
+
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 3, 1)
+    plt.plot(train_losses, 'r-')
+    plt.title(f'{model_name} - Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.grid(True)
+
+    plt.subplot(1, 3, 2)
+    plt.plot(train_accs, 'b-')
+    plt.title(f'{model_name} - Training Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.grid(True)
+
+    plt.subplot(1, 3, 3)
+    plt.plot(train_f1s, 'g-')
+    plt.title(f'{model_name} - Training F1 Score')
+    plt.xlabel('Epoch')
+    plt.ylabel('F1 Score')
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, f'{model_name}_training_curves.png'))
+    plt.close()
+
+    return {
+        'model_name': model_name,
+        'train_losses': train_losses,
+        'train_accs': train_accs,
+        'train_f1s': train_f1s,
+        'best_train_f1': best_train_f1,
+        'training_time': training_time,
+        'features': all_features,
+        'labels': all_labels,
+        'train_confusion_matrix': cm,
+        'class_accuracies': checkpoint.get('class_accuracies', {}),
+        'class_f1_scores': checkpoint.get('class_f1_scores', {})
+    }
+
+def process_realtime(model, target_class, video_path=None, fps=30):
+    cap = cv2.VideoCapture(video_path if video_path else 0)
+    if not cap.isOpened():
+        print("Error: Could not open video or webcam.")
+        return
+
+    transform = CUDATransform(transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ]))
+
+    log_file = os.path.join(LOG_DIR, f"{os.path.basename(video_path) if video_path else 'webcam'}_{target_class}_log.json")
+    flag_segments = []
+    start_time = None
+    frame_count = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_count += 1
+        input_tensor = transform(frame).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            logits, _ = model(input_tensor)
+            pred = (torch.sigmoid(logits.squeeze()) > 0.5).int().item()
+
+        current_time = frame_count / fps
+        if pred == 0:  # Target class absent
+            if start_time is None:
+                start_time = current_time
+        else:  # Target class present
+            if start_time is not None:
+                end_time = current_time
+                flag_segments.append({
+                    "start": f"{int(start_time//60):02d}:{int(start_time%60):02d}.{int((start_time%1)*1000):03d}",
+                    "end": f"{int(end_time//60):02d}:{int(end_time%60):02d}.{int((end_time%1)*1000):03d}",
+                    "missing": target_class
+                })
+                start_time = None
+
+    if start_time is not None:
+        end_time = frame_count / fps
+        flag_segments.append({
+            "start": f"{int(start_time//60):02d}:{int(start_time%60):02d}.{int((start_time%1)*1000):03d}",
+            "end": f"{int(end_time//60):02d}:{int(end_time%60):02d}.{int((end_time%1)*1000):03d}",
+            "missing": target_class
+        })
+
+    status = "accepted" if not flag_segments else "flagged"
+    log_data = {
+        "source": os.path.basename(video_path) if video_path else "webcam",
+        "target_class": target_class,
+        "status": status,
+        "flag_segments": flag_segments,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "frame_rate": fps
+    }
+
+    with open(log_file, 'w') as f:
+        json.dump(log_data, f, indent=4)
+    print(f"Processed {video_path or 'webcam'} for {target_class}. Status: {status}. Log saved to {log_file}")
+
+    cap.release()
+
+def plot_training_metrics(results_dict, save_dir=PLOT_DIR):
+    model_names = list(results_dict.keys())
+
+    plt.figure(figsize=(15, 8))
+    for name in model_names:
+        plt.plot(results_dict[name]['train_accs'], label=f"{name} (Best: {max(results_dict[name]['train_accs']):.4f})")
+    plt.title('Training Accuracy Comparison Across Models')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'accuracy_comparison.png'))
+    plt.close()
+
+    plt.figure(figsize=(15, 8))
+    for name in model_names:
+        plt.plot(results_dict[name]['train_f1s'], label=f"{name} (Best: {max(results_dict[name]['train_f1s']):.4f})")
+    plt.title('Training F1 Score Comparison Across Models')
+    plt.xlabel('Epoch')
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'f1_comparison.png'))
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    train_times = [results_dict[name]['training_time'] for name in model_names]
+    plt.bar(model_names, train_times, color=['royalblue', 'forestgreen', 'firebrick'])
+    plt.title('Training Time Comparison')
+    plt.xlabel('Model')
+    plt.ylabel('Time (seconds)')
+    for i, v in enumerate(train_times):
+        plt.text(i, v + 50, f"{v:.1f}s", ha='center')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'training_time_comparison.png'))
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    best_f1s = [results_dict[name]['best_train_f1'] for name in model_names]
+    plt.bar(model_names, best_f1s, color=['royalblue', 'forestgreen', 'firebrick'])
+    plt.title('Best F1 Score Comparison')
+    plt.xlabel('Model')
+    plt.ylabel('F1 Score')
+    plt.ylim(0, 1.0)
+    for i, v in enumerate(best_f1s):
+        plt.text(i, v + 0.02, f"{v:.4f}", ha='center')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'best_f1_comparison.png'))
+    plt.close()
+
+    plt.figure(figsize=(15, 10))
+    width = 0.25
+    x = np.arange(len(PPE_ITEMS))
+
+    for i, name in enumerate(model_names):
+        class_f1s = [results_dict[name]['class_f1_scores'].get(cls, 0) for cls in PPE_ITEMS]
+        plt.bar(x + i*width, class_f1s, width=width, label=name)
+
+    plt.xticks(x + width, PPE_ITEMS, rotation=45)
+    plt.title('Class-wise F1 Scores Across Models')
+    plt.xlabel('Class')
+    plt.ylabel('F1 Score')
+    plt.ylim(0, 1.0)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'class_f1_comparison.png'))
+    plt.close()
+
+    if len(model_names) > 1:
+        fig, axes = plt.subplots(1, len(model_names), figsize=(20, 6))
+        for i, name in enumerate(model_names):
+            cm = results_dict[name]['train_confusion_matrix']
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                       xticklabels=['Negative', 'Positive'], yticklabels=['Negative', 'Positive'], ax=axes[i])
+            axes[i].set_title(f'{name} - Confusion Matrix')
+            axes[i].set_xlabel('Predicted')
+            axes[i].set_ylabel('True')
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'confusion_matrices_comparison.png'))
+        plt.close()
+
+def visualize_combined_features(results_dict, save_dir=PLOT_DIR):
+    model_names = list(results_dict.keys())
+    fig, axes = plt.subplots(1, len(model_names), figsize=(20, 7))
+    if len(model_names) == 1:
+        axes = [axes]
+
+    for i, name in enumerate(model_names):
+        model_features = results_dict[name]['features']
+        model_labels = results_dict[name]['labels']
+
+        if len(model_features) > 0 and RUN_T_SNE:
+            sample_size = min(50, len(model_features))
+            indices = np.random.choice(len(model_features), sample_size, replace=False)
+            features = model_features[indices]
+            labels = model_labels[indices]
+
+            if np.any(np.isnan(features)) or np.any(np.isinf(features)):
+                print(f"  Warning: NaN or Inf values in {name} features. Skipping visualization.")
+            else:
+                try:
+                    pca = PCA(n_components=30)
+                    features_reduced = pca.fit_transform(features)
+                    tsne = TSNE(n_components=2, perplexity=15, n_iter=300, random_state=42, n_jobs=1)
+                    tsne_result = tsne.fit_transform(features_reduced)
+                    tsne_x = tsne_result[:, 0]
+                    tsne_y = tsne_result[:, 1]
+
+                    for j, label_name in enumerate(PPE_ITEMS):
+                        mask = labels[:, j] == 1
+                        if np.any(mask):
+                            axes[i].scatter(tsne_x[mask], tsne_y[mask],
+                                         label=label_name, color=CLASS_COLORS[j], alpha=0.6)
+
+                    axes[i].set_title(f'{name}\nFeature Space Visualization')
+                    axes[i].set_xlabel('t-SNE Component 1')
+                    axes[i].set_ylabel('t-SNE Component 2')
+                    if i == len(model_names) - 1:
+                        axes[i].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                except Exception as e:
+                    print(f"  Error during t-SNE visualization for {name}: {e}")
+                    axes[i].text(0.5, 0.5, f"Visualization failed: {str(e)}",
+                              ha='center', va='center', transform=axes[i].transAxes)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'combined_tsne_visualization.png'))
+    plt.close()
+
+    print("Skipping 3D t-SNE and cluster analysis to conserve memory.")
+
+def main():
+    parser = argparse.ArgumentParser(description="RAPIDS-accelerated PPE Detection Training and Real-time Processing")
+    parser.add_argument("--target-class", type=str, choices=PPE_ITEMS, help="Specify target class for single-object detection")
+    parser.add_argument("--video", type=str, help="Path to video file for real-time processing (optional)")
+    args = parser.parse_args()
+
+    print("\n" + "="*50)
+    print("RAPIDS-accelerated PPE Detection Training and Real-time Processing")
+    print("="*50 + "\n")
+
+    start_time = time.time()
+
+    conn = connect_db()
+
+    try:
+        print(f"\nLoading COCO dataset from {TRAIN_ANN_FILE}...")
+        coco = COCO(TRAIN_ANN_FILE)
+        if not coco.dataset or not coco.getImgIds():
+            raise ValueError(f"No images or annotations found in {TRAIN_ANN_FILE}. Verify the file exists and contains valid COCO data.")
+
+        data_dir = [TRAIN_DATA_DIR]
+
+        print(f"Categories: {len(coco.cats)}")
+        print(f"Images: {len(coco.imgs)}")
+        print(f"Annotations: {len(coco.anns)}")
+
+        class_dist = {cat['name']: len(coco.getAnnIds(catIds=cat_id))
+                     for cat_id, cat in coco.cats.items()}
+        print("Class distribution:")
+        for cls, count in class_dist.items():
+            print(f"  {cls}: {count}")
+
+        plt.figure(figsize=(12, 8))
+        plt.bar(class_dist.keys(), class_dist.values(), color=CLASS_COLORS)
+        plt.title('Class Distribution in Train Dataset')
+        plt.xlabel('Class')
+        plt.ylabel('Count')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(PLOT_DIR, 'class_distribution.png'))
+        plt.close()
+
+        print("\nCreating dataset and dataloader...")
+        train_dataset = CocoDataset(coco, TRAIN_DATA_DIR, transform=cuda_transform, phase='train', target_class=args.target_class)
+        if len(train_dataset) == 0:
+            raise ValueError(f"Dataset is empty. Verify images exist in {TRAIN_DATA_DIR} and match {TRAIN_ANN_FILE}.")
+
+        train_size = len(train_dataset)
+        train_sampler = BalancedSampler(train_dataset, oversample_factor=2.0) if not args.target_class else None
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler, shuffle=not train_sampler, num_workers=2, pin_memory=False, prefetch_factor=1)
+
+        print(f"Train dataset size: {train_size}")
+
+        print("\nInitializing models...")
+        models = {
+            'CustomCNN': EnhancedCustomCNN(num_classes=1 if args.target_class else len(PPE_ITEMS)).to(DEVICE),
+            'ResNet18': ModifiedResNet(num_classes=1 if args.target_class else len(PPE_ITEMS)).to(DEVICE),
+            'EfficientNet': EfficientNetModel(num_classes=1 if args.target_class else len(PPE_ITEMS)).to(DEVICE)
+        }
+
+        results = {}
+        for name, model in models.items():
+            print(f"\nPreparing to train {name}...")
+            criterion = nn.BCEWithLogitsLoss()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
+
+            results[name] = train_model(model, name, train_loader, criterion, optimizer, scheduler, conn, target_class=args.target_class)
+
+        print("\nGenerating comparative visualizations...")
+        plot_training_metrics(results)
+        visualize_combined_features(results)
+
+        summary = {
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:M:%S"),
+            'total_runtime': time.time() - start_time,
+            'models': list(models.keys()),
+            'training_results': {name: {'best_f1': results[name]['best_train_f1'], 'training_time': results[name]['training_time']} for name in models.keys()}
+        }
+
+        with open(os.path.join(OUTPUT_DIR, 'training_summary.json'), 'w') as f:
+            json.dump(summary, f, indent=4)
+
+        if args.video:
+            print(f"\nProcessing video: {args.video}...")
+            for name, model in models.items():
+                if args.target_class:
+                    checkpoint = torch.load(os.path.join(MODEL_DIR, f"{name}_best.pt"))
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    process_realtime(model, args.target_class, args.video)
+
+        print("\n" + "="*50)
+        print(f"Completed in {time.time() - start_time:.2f} seconds")
+        print(f"All results saved to {OUTPUT_DIR}")
+        print("="*50 + "\n")
+
+    except Exception as e:
+        print(f"\nError during execution: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if conn:
+            conn.close()
+            print("Database connection closed.")
+
+if __name__ == "__main__":
+    main()
+
+
+Also if you to make sure the code is compatible with my real time code here is my real time code :
+
+1. index.html:
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PPE Detection System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4.7.5/dist/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.53.0/dist/apexcharts.min.js"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .hidden { display: none; }
+        .dark { background-color: #1f2937; color: white; }
+        .dark .bg-white { background-color: #374151; }
+        .dark .bg-gray-100 { background-color: #1f2937; }
+        .dark .text-black { color: white; }
+        .progress-container { margin-top: 10px; }
+        .loading { color: #4b5563; font-style: italic; }
+        .navbar { backdrop-filter: blur(10px); background: rgba(255, 255, 255, 0.1); }
+        .sample-strip { display: flex; overflow-x: auto; gap: 1rem; padding: 1rem; }
+        .sample-card { flex: 0 0 auto; width: 150px; text-align: center; }
+        .sample-card img { width: 100%; height: auto; border-radius: 8px; }
+        .gradient-bg { background: linear-gradient(135deg, #3b82f6, #10b981); }
+        .card-hover { transition: transform 0.3s; }
+        .card-hover:hover { transform: translateY(-5px); }
+    </style>
+</head>
+<body class="bg-gray-100 transition-colors duration-300">
+    <!-- Navigation Bar -->
+    <nav class="navbar fixed top-0 left-0 w-full z-50 shadow-lg">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16">
+                <div class="flex items-center">
+                    <h1 class="text-2xl font-bold text-white">PPE Detection System</h1>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <button onclick="showScreen('login')" class="text-white hover:text-gray-200">Home</button>
+                    <button onclick="showScreen('about')" class="text-white hover:text-gray-200">About Us</button>
+                    <button onclick="showScreen('description')" class="text-white hover:text-gray-200">Description</button>
+                    <button onclick="showScreen('admin')" class="text-white hover:text-gray-200">Admin Dashboard</button>
+                    <button id="theme-toggle" onclick="toggleTheme()" class="p-2 rounded bg-gray-200 dark:bg-gray-700">🌙</button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Login Screen -->
+    <div id="login-screen" class="flex items-center justify-center min-h-screen pt-16">
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-md card-hover">
+            <h1 class="text-3xl font-bold mb-6 text-center text-gray-800">PPE Detection System</h1>
+            <div class="mb-4">
+                <label class="block mb-2 text-sm font-medium text-gray-700">Employee ID</label>
+                <input id="employee-id" type="text" class="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div class="mb-6">
+                <label class="block mb-2 text-sm font-medium text-gray-700">Department</label>
+                <select id="department" class="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500">
+                    <option value="Admin">Admin</option>
+                    <option value="Maintenance">Maintenance</option>
+                </select>
+            </div>
+            <button onclick="handleLogin()" class="w-full bg-blue-600 text-white p-3 rounded-lg hover:bg-blue-700 transition">Login</button>
+            <button onclick="showScreen('admin')" class="w-full mt-3 bg-gray-500 text-white p-3 rounded-lg hover:bg-gray-600 transition">Admin Dashboard</button>
+        </div>
+    </div>
+
+    <!-- Selection Screen -->
+    <div id="selection-screen" class="hidden flex items-center justify-center min-h-screen pt-16">
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-md card-hover">
+            <h1 class="text-3xl font-bold mb-6 text-center text-gray-800">Select Detection Preferences</h1>
+            <div class="mb-4">
+                <label class="block mb-2 text-sm font-medium text-gray-700">Target Class</label>
+                <select id="target-class" class="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500">
+                    <option value="Hardhat">Hardhat</option>
+                    <option value="NO-Hardhat">NO-Hardhat</option>
+                    <option value="Safety Vest">Safety Vest</option>
+                    <option value="NO-Safety Vest">NO-Safety Vest</option>
+                    <option value="Gloves">Gloves</option>
+                    <option value="NO-Gloves">NO-Gloves</option>
+                    <option value="Goggles">Goggles</option>
+                    <option value="NO-Goggles">NO-Goggles</option>
+                    <option value="Mask">Mask</option>
+                    <option value="NO-Mask">NO-Mask</option>
+                    <option value="Fall-Detected">Fall-Detected</option>
+                    <option value="Person">Person</option>
+                </select>
+            </div>
+            <div class="mb-6">
+                <label class="block mb-2 text-sm font-medium text-gray-700">Model</label>
+                <select id="model" class="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500">
+                    <option value="CustomCNN">CustomCNN</option>
+                    <option value="ResNet18">ResNet18</option>
+                    <option value="EfficientNet">EfficientNet</option>
+                </select>
+            </div>
+            <button onclick="handleProceed()" class="w-full bg-blue-600 text-white p-3 rounded-lg hover:bg-blue-700 transition">Proceed to Detection</button>
+            <button onclick="showScreen('login')" class="w-full mt-3 bg-gray-500 text-white p-3 rounded-lg hover:bg-gray-600 transition">Back to Login</button>
+        </div>
+    </div>
+
+    <!-- Main Dashboard -->
+    <div id="main-screen" class="hidden container mx-auto p-4 pt-20">
+        <div class="flex justify-between items-center mb-6">
+            <div id="user-info" class="text-lg font-semibold text-gray-800"></div>
+            <button onclick="showScreen('login')" class="bg-red-500 text-white p-3 rounded-lg hover:bg-red-600 transition">Logout</button>
+        </div>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div class="bg-white p-6 rounded-lg shadow-xl card-hover">
+                <h2 class="text-xl font-bold mb-4 text-gray-800">Video Feed</h2>
+                <img id="video-feed" src="" alt="Video Feed" class="w-full h-auto hidden rounded-lg">
+                <div id="camera-off" class="flex items-center justify-center h-96 bg-gray-800 text-white rounded-lg">Camera Off</div>
+            </div>
+            <div class="bg-white p-6 rounded-lg shadow-xl card-hover">
+                <h2 class="text-xl font-bold mb-4 text-gray-800">Real-time PPE Stats</h2>
+                <div id="stats-chart" class="h-80"></div>
+                <p id="status" class="mt-4 font-semibold text-gray-700">Status: No status detected yet</p>
+                <p id="session-time" class="text-gray-600">Session Time: 00:00:00</p>
+            </div>
+        </div>
+        <div class="mt-6 flex flex-wrap gap-4">
+            <button onclick="startCamera()" class="bg-green-500 text-white p-3 rounded-lg hover:bg-green-600 transition">Start Camera</button>
+            <button onclick="stopCamera()" class="bg-red-500 text-white p-3 rounded-lg hover:bg-red-600 transition">Stop Camera</button>
+            <label class="bg-blue-500 text-white p-3 rounded-lg hover:bg-blue-600 transition cursor-pointer">
+                Upload Video
+                <input id="video-upload" type="file" accept="video/*" onchange="uploadVideo(event)" class="hidden">
+            </label>
+            <button onclick="testSamples()" class="bg-purple-500 text-white p-3 rounded-lg hover:bg-purple-600 transition">Test Random Samples</button>
+        </div>
+        <div id="sample-strip" class="sample-strip mt-6 bg-white p-4 rounded-lg shadow-xl hidden">
+            <h2 class="text-xl font-bold mb-4 text-gray-800">Test Sample Results</h2>
+            <div id="sample-container" class="flex gap-4"></div>
+        </div>
+    </div>
+
+    <!-- About Us Page -->
+    <div id="about-screen" class="hidden container mx-auto p-4 pt-20">
+        <div class="bg-white p-8 rounded-lg shadow-xl card-hover">
+            <h1 class="text-3xl font-bold mb-6 text-gray-800">About Us</h1>
+            <p class="text-gray-600 mb-4">
+                Welcome to the PPE Detection System, a cutting-edge solution for workplace safety. Our team is dedicated to leveraging AI and computer vision to ensure compliance with personal protective equipment (PPE) standards.
+            </p>
+            <p class="text-gray-600 mb-4">
+                Developed by a group of passionate engineers and data scientists, this project combines advanced deep learning models, real-time video processing, and a user-friendly interface to enhance safety protocols across industries.
+            </p>
+            <p class="text-gray-600">
+                Contact us at <a href="mailto:support@ppedetection.com" class="text-blue-600 hover:underline">support@ppedetection.com</a> for inquiries or feedback.
+            </p>
+        </div>
+    </div>
+
+    <!-- Description Page -->
+    <div id="description-screen" class="hidden container mx-auto p-4 pt-20">
+        <div class="bg-white p-8 rounded-lg shadow-xl card-hover">
+            <h1 class="text-3xl font-bold mb-6 text-gray-800">Project Description</h1>
+            <h2 class="text-2xl font-semibold mb-4 text-gray-700">Training Process</h2>
+            <p class="text-gray-600 mb-4">
+                The PPE Detection System was trained on a diverse dataset of workplace images, annotated for PPE compliance (Hardhat, Safety Vest, Gloves, etc.). We employed a rigorous training pipeline:
+            </p>
+            <ul class="list-disc list-inside text-gray-600 mb-4">
+                <li>Data augmentation (rotation, flipping, brightness adjustments) to enhance model robustness.</li>
+                <li>Transfer learning with pre-trained models (ResNet18, EfficientNet-B0) and a custom CNN architecture.</li>
+                <li>Optimization using AdamW with a learning rate scheduler, achieving 95%+ accuracy on validation sets.</li>
+                <li>Training on NVIDIA GPUs with CUDA for accelerated computation.</li>
+            </ul>
+            <h2 class="text-2xl font-semibold mb-4 text-gray-700">CUDA Libraries</h2>
+            <p class="text-gray-600 mb-4">
+                We leveraged NVIDIA's CUDA ecosystem to accelerate training and inference:
+            </p>
+            <ul class="list-disc list-inside text-gray-600 mb-4">
+                <li><strong>RAPIDS</strong>: Used for GPU-accelerated data preprocessing, including image loading and transformation with cuDF and cuML.</li>
+                <li><strong>cuDNN</strong>: Optimized deep neural network primitives for convolution and pooling operations.</li>
+                <li><strong>CUDA Toolkit</strong>: Enabled custom GPU kernels for real-time image processing.</li>
+                <li><strong>PyTorch with CUDA</strong>: Provided seamless integration for model training and deployment.</li>
+            </ul>
+            <h2 class="text-2xl font-semibold mb-4 text-gray-700">Models Built</h2>
+            <p class="text-gray-600 mb-4">
+                We developed and fine-tuned three models to balance accuracy and performance:
+            </p>
+            <ul class="list-disc list-inside text-gray-600 mb-4">
+                <li><strong>CustomCNN</strong>: A deep convolutional neural network with batch normalization and dropout, designed for low-latency inference.</li>
+                <li><strong>ResNet18</strong>: A pre-trained residual network fine-tuned for PPE detection, offering robust feature extraction.</li>
+                <li><strong>EfficientNet-B0</strong>: A state-of-the-art model scaled for high accuracy, optimized for GPU inference.</li>
+            </ul>
+            <p class="text-gray-600">
+                These models were trained on a cluster of NVIDIA A100 GPUs, leveraging RAPIDS and cuDNN for maximum efficiency, and are deployed with PyTorch for real-time detection.
+            </p>
+        </div>
+    </div>
+
+    <!-- Admin Dashboard -->
+    <div id="admin-screen" class="hidden container mx-auto p-4 pt-20">
+        <div class="bg-white p-8 rounded-lg shadow-xl card-hover">
+            <div class="flex justify-between items-center mb-6">
+                <h1 class="text-3xl font-bold text-gray-800">Admin Dashboard</h1>
+                <button onclick="showScreen('login')" class="bg-gray-500 text-white p-3 rounded-lg hover:bg-gray-600 transition">Back to Login</button>
+            </div>
+            <div class="flex flex-wrap gap-4 mb-6">
+                <div>
+                    <label class="block mb-2 text-sm font-medium text-gray-700">Department</label>
+                    <select id="admin-dept" class="p-3 border rounded-lg focus:ring-2 focus:ring-blue-500">
+                        <option value="All">All</option>
+                        <option value="Admin">Admin</option>
+                        <option value="Maintenance">Maintenance</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block mb-2 text-sm font-medium text-gray-700">Date Range</label>
+                    <select id="admin-date" class="p-3 border rounded-lg focus:ring-2 focus:ring-blue-500">
+                        <option value="Last 7 Days">Last 7 Days</option>
+                        <option value="Last 30 Days">Last 30 Days</option>
+                        <option value="All Time">All Time</option>
+                    </select>
+                </div>
+                <button onclick="fetchAdminStats()" class="bg-blue-600 text-white p-3 rounded-lg hover:bg-blue-700 transition">Apply Filters</button>
+            </div>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div>
+                    <h2 class="text-xl font-bold mb-4 text-gray-800">Compliance Trends</h2>
+                    <div id="compliance-chart" class="h-80"></div>
+                </div>
+                <div>
+                    <h2 class="text-xl font-bold mb-4 text-gray-800">Acceptance Rate Trend</h2>
+                    <div id="acceptance-chart" class="h-80"></div>
+                </div>
+            </div>
+            <div class="mt-6">
+                <h2 class="text-xl font-bold mb-4 text-gray-800">Employee Details</h2>
+                <p id="admin-loading" class="loading hidden">Loading...</p>
+                <div class="overflow-x-auto">
+                    <table class="w-full border-collapse">
+                        <thead>
+                            <tr class="bg-gray-200">
+                                <th class="border p-3 text-left">Employee ID</th>
+                                <th class="border p-3 text-left">Department</th>
+                                <th class="border p-3 text-left">Sessions</th>
+                                <th class="border p-3 text-left">Acceptance Rate</th>
+                                <th class="border p-3 text-left">Flagged Items</th>
+                            </tr>
+                        </thead>
+                        <tbody id="employee-table"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io('http://localhost:8000');
+        let statsChart, complianceChart, acceptanceChart;
+        let isDark = false;
+
+        socket.on('frame', (data) => {
+            document.getElementById('video-feed').src = `data:image/jpeg;base64,${data.frame}`;
+            document.getElementById('video-feed').classList.remove('hidden');
+            document.getElementById('camera-off').classList.add('hidden');
+            updateStatsChart(data.stats, document.getElementById('target-class').value);
+            document.getElementById('status').textContent = `Status: ${data.status}`;
+            document.getElementById('session-time').textContent = `Session Time: ${data.sessionTime}`;
+        });
+
+        socket.on('error', (data) => {
+            alert(data.message);
+        });
+
+        function showScreen(screen) {
+            document.querySelectorAll('#login-screen, #selection-screen, #main-screen, #about-screen, #description-screen, #admin-screen').forEach(el => el.classList.add('hidden'));
+            document.getElementById(`${screen}-screen`).classList.remove('hidden');
+        }
+
+        function toggleTheme() {
+            isDark = !isDark;
+            document.body.classList.toggle('dark');
+            document.getElementById('theme-toggle').textContent = isDark ? '☀️' : '🌙';
+        }
+
+        async function handleLogin() {
+            const employeeId = document.getElementById('employee-id').value.trim();
+            const department = document.getElementById('department').value;
+            if (!employeeId) {
+                alert('Please enter your Employee ID');
+                return;
+            }
+            if (!['Admin', 'Maintenance'].includes(department)) {
+                alert('Please select a valid department');
+                return;
+            }
+            try {
+                await axios.post('http://localhost:8000/login', { employee_id: employeeId, department });
+                document.getElementById('user-info').textContent = `Employee ID: ${employeeId} | Department: ${department} | Target: ${document.getElementById('target-class').value} | Model: ${document.getElementById('model').value}`;
+                showScreen('selection');
+            } catch (error) {
+                console.error('Login error:', error);
+                alert(`Login failed: ${error.response?.data?.detail || error.message}`);
+            }
+        }
+
+        async function handleProceed() {
+            const targetClass = document.getElementById('target-class').value;
+            const model = document.getElementById('model').value;
+            try {
+                await axios.post('http://localhost:8000/select', { target_class: targetClass, model });
+                document.getElementById('user-info').textContent = `Employee ID: ${document.getElementById('employee-id').value} | Department: ${document.getElementById('department').value} | Target: ${targetClass} | Model: ${model}`;
+                showScreen('main');
+            } catch (error) {
+                console.error('Proceed error:', error);
+                alert(`Failed to proceed: ${error.response?.data?.detail || error.message}`);
+            }
+        }
+
+        function startCamera() {
+            socket.emit('start_camera');
+        }
+
+        function stopCamera() {
+            socket.emit('stop_camera');
+            document.getElementById('video-feed').classList.add('hidden');
+            document.getElementById('camera-off').classList.remove('hidden');
+        }
+
+        async function uploadVideo(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const progressBar = document.createElement('div');
+            progressBar.className = 'w-full bg-gray-200 rounded progress-container';
+            progressBar.innerHTML = '<div id="progress" class="bg-blue-500 h-4 rounded" style="width: 0%"></div>';
+            document.getElementById('main-screen').appendChild(progressBar);
+            const formData = new FormData();
+            formData.append('file', file);
+            try {
+                const response = await axios.post('http://localhost:8000/upload_video', formData, {
+                    headers: { 'Content-Type': 'multipart/form-data' },
+                    timeout: 300000,
+                    onUploadProgress: (progressEvent) => {
+                        const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+                        document.getElementById('progress').style.width = `${percentCompleted}%`;
+                    }
+                });
+                alert(response.data.message);
+                updateStatsChart(response.data.stats, document.getElementById('target-class').value);
+            } catch (error) {
+                console.error('Video upload error:', error);
+                let errorMessage = 'Video upload failed';
+                if (error.response) {
+                    errorMessage += `: ${error.response.data.detail || error.response.statusText}`;
+                } else if (error.request) {
+                    errorMessage += ': No response from server';
+                } else {
+                    errorMessage += `: ${error.message}`;
+                }
+                alert(errorMessage);
+            } finally {
+                progressBar.remove();
+            }
+        }
+
+        async function testSamples() {
+            try {
+                const response = await axios.get('http://localhost:8000/test_samples');
+                alert(response.data.message);
+                updateStatsChart(response.data.stats, document.getElementById('target-class').value);
+                displayTestSamples(response.data.samples);
+            } catch (error) {
+                console.error('Test samples error:', error);
+                alert(`Test failed: ${error.response?.data?.detail || error.message}`);
+            }
+        }
+
+        function displayTestSamples(samples) {
+            const container = document.getElementById('sample-container');
+            container.innerHTML = '';
+            samples.forEach(sample => {
+                const card = document.createElement('div');
+                card.className = 'sample-card';
+                card.innerHTML = `
+                    <img src="data:image/jpeg;base64,${sample.image}" alt="Test Sample">
+                    <p class="text-sm font-medium text-gray-700 mt-2">${sample.prediction}</p>
+                    <p class="text-xs text-gray-500">Target: ${sample.target_class}</p>
+                `;
+                container.appendChild(card);
+            });
+            document.getElementById('sample-strip').classList.remove('hidden');
+        }
+
+        function updateStatsChart(stats, targetClass) {
+            if (typeof ApexCharts === 'undefined') {
+                console.error('ApexCharts is not loaded');
+                alert('Failed to update stats chart: ApexCharts library is not loaded.');
+                return;
+            }
+            try {
+                const labels = Object.keys(stats).filter(k => stats[k] > 0);
+                const data = Object.values(stats).filter(v => v > 0);
+                const options = {
+                    chart: {
+                        type: 'pie',
+                        height: '100%'
+                    },
+                    series: data.length ? data : [1],
+                    labels: labels.length ? labels : ['No Data'],
+                    colors: labels.map(l => l === 'Accepted' ? '#00FF00' : '#FF0000'),
+                    title: {
+                        text: `PPE Compliance (${targetClass})`,
+                        align: 'center'
+                    },
+                    legend: {
+                        position: 'top'
+                    },
+                    noData: {
+                        text: 'No Data Available'
+                    }
+                };
+                if (statsChart) {
+                    statsChart.destroy();
+                }
+                statsChart = new ApexCharts(document.querySelector('#stats-chart'), options);
+                statsChart.render();
+            } catch (error) {
+                console.error('Error updating stats chart:', error);
+                alert('Failed to update stats chart: ' + error.message);
+            }
+        }
+
+        async function fetchAdminStats() {
+            const dept = document.getElementById('admin-dept').value;
+            const dateRange = document.getElementById('admin-date').value;
+            const loading = document.getElementById('admin-loading');
+            loading.classList.remove('hidden');
+            try {
+                const response = await axios.get('http://localhost:8000/admin_stats', {
+                    params: { department: dept, date_range: dateRange },
+                    timeout: 10000
+                });
+                const { compliance, employees } = response.data;
+
+                const complianceLabels = compliance.map(c => c.status).filter((_, i) => compliance[i].total > 0);
+                const complianceData = compliance.map(c => c.total).filter(t => t > 0);
+                const complianceOptions = {
+                    chart: {
+                        type: 'pie',
+                        height: '100%'
+                    },
+                    series: complianceData.length ? complianceData : [1],
+                    labels: complianceLabels.length ? complianceLabels : ['No Data'],
+                    colors: complianceLabels.map(l => l === 'Accepted' ? '#00FF00' : l === 'Flagged' ? '#FF0000' : '#CCCCCC'),
+                    title: {
+                        text: 'Compliance Trends',
+                        align: 'center'
+                    },
+                    legend: {
+                        show: !!complianceLabels.length,
+                        position: 'top'
+                    },
+                    noData: {
+                        text: 'No Data Available'
+                    }
+                };
+                if (complianceChart) {
+                    complianceChart.destroy();
+                }
+                complianceChart = new ApexCharts(document.querySelector('#compliance-chart'), complianceOptions);
+                complianceChart.render();
+
+                const empLabels = employees.filter(e => e.session_count > 0).map(e => e.employee_id);
+                const empData = employees.filter(e => e.session_count > 0).map(e => e.acceptance_rate);
+                const acceptanceOptions = {
+                    chart: {
+                        type: 'bar',
+                        height: '100%'
+                    },
+                    series: [{
+                        name: 'Acceptance Rate',
+                        data: empData.length ? empData : [0]
+                    }],
+                    xaxis: {
+                        categories: empLabels.length ? empLabels : ['No Data']
+                    },
+                    title: {
+                        text: 'Acceptance Rate Trend',
+                        align: 'center'
+                    },
+                    yaxis: {
+                        min: 0,
+                        max: 100
+                    },
+                    colors: ['#00FF00'],
+                    noData: {
+                        text: 'No Data Available'
+                    }
+                };
+                if (acceptanceChart) {
+                    acceptanceChart.destroy();
+                }
+                acceptanceChart = new ApexCharts(document.querySelector('#acceptance-chart'), acceptanceOptions);
+                acceptanceChart.render();
+
+                const tableBody = document.getElementById('employee-table');
+                tableBody.innerHTML = employees.length ? employees.map(emp => `
+                    <tr class="hover:bg-gray-100">
+                        <td class="border p-3">${emp.employee_id}</td>
+                        <td class="border p-3">${emp.department}</td>
+                        <td class="border p-3">${emp.session_count}</td>
+                        <td class="border p-3">${emp.acceptance_rate.toFixed(1)}</td>
+                        <td class="border p-3">${emp.flagged_items || 'None'}</td>
+                    </tr>
+                `).join('') : '<tr><td colspan="5" class="border p-3 text-center">No employee data</td></tr>';
+            } catch (error) {
+                console.error('Admin stats error:', error);
+                alert(`Failed to fetch admin stats: ${error.response?.data?.detail || error.message}`);
+                document.getElementById('employee-table').innerHTML = '<tr><td colspan="5" class="border p-3 text-center">Error loading data</td></tr>';
+            } finally {
+                loading.classList.add('hidden');
+            }
+        }
+
+        console.log('ApexCharts loading status:', typeof ApexCharts !== 'undefined' ? 'Loaded' : 'Not loaded');
+    </script>
+</body>
+</html>
+
+2. server.py:
+
+import cv2
+import torch
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from socketio import AsyncServer, ASGIApp
+import base64
+import asyncio
+from PIL import Image
+import io
+import os
+import psycopg
+import time
+from datetime import datetime, timedelta
+import random
+import logging
+import tempfile
+from pydantic import BaseModel
+
+from original_code import (
+    EnhancedCustomCNN, ModifiedResNet, EfficientNetModel, load_model, transform,
+    PPE_ITEMS, PPE_COLORS, VALID_DEPTS, MAX_FRAMES_TO_PROCESS, DETECTION_CONFIDENCE_THRESHOLD,
+    DB_PARAMS, connect_db, init_database, PPEHistory, face_cascade, detect_faces,
+    device, BASE_DIR
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="."), name="static")
+sio = AsyncServer(async_mode='asgi', cors_allowed_origins='*')
+app.mount('/socket.io', ASGIApp(sio))
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class LoginData(BaseModel):
+    employee_id: str
+    department: str
+
+class SelectData(BaseModel):
+    target_class: str
+    model: str
+
+state = {
+    "user_id": None,
+    "department": None,
+    "target_class": None,
+    "selected_model": None,
+    "model": None,
+    "num_classes": 1,
+    "ppe_history": None,
+    "ppe_stats": {"Accepted": 0, "Flagged": 0},
+    "cap": None,
+    "is_running": False,
+    "start_time": None,
+    "frame_count": 0,
+    "conn": connect_db(),
+}
+
+@sio.event
+async def connect(sid, environ):
+    logger.info(f"Client connected: {sid}")
+
+@sio.event
+async def disconnect(sid):
+    logger.info(f"Client disconnected: {sid}")
+
+@app.on_event("startup")
+async def startup_event():
+    init_database(state["conn"])
+    logger.info("Application startup completed")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if state["conn"]:
+        state["conn"].close()
+        logger.info("Database connection closed")
+
+@app.post("/login")
+async def login(data: LoginData):
+    employee_id = data.employee_id.strip()
+    department = data.department
+    if not employee_id:
+        logger.warning("Login attempted with empty employee ID")
+        raise HTTPException(status_code=400, detail="Employee ID is required")
+    if department not in VALID_DEPTS:
+        logger.warning(f"Invalid department: {department}")
+        raise HTTPException(status_code=400, detail="Invalid department")
+    state["user_id"] = employee_id
+    state["department"] = department
+    try:
+        with state["conn"].cursor() as cur:
+            cur.execute("SELECT employee_id FROM employees WHERE employee_id = %s", (employee_id,))
+            if not cur.fetchone():
+                cur.execute("INSERT INTO employees (employee_id, department) VALUES (%s, %s)", (employee_id, department))
+                state["conn"].commit()
+                logger.info(f"New employee registered: {employee_id}, {department}")
+    except psycopg.Error as e:
+        logger.error(f"Database error during login: {e}")
+        state["conn"].rollback()
+        raise HTTPException(status_code=500, detail="Database error")
+    return {"message": "Login successful"}
+
+@app.post("/select")
+async def select(data: SelectData):
+    if data.target_class not in PPE_ITEMS:
+        logger.warning(f"Invalid target class: {data.target_class}")
+        raise HTTPException(status_code=400, detail="Invalid target class")
+    if data.model not in ["CustomCNN", "ResNet18", "EfficientNet"]:
+        logger.warning(f"Invalid model: {data.model}")
+        raise HTTPException(status_code=400, detail="Invalid model")
+    state["target_class"] = data.target_class
+    state["selected_model"] = data.model
+    try:
+        state["model"], state["num_classes"] = load_model(state["selected_model"])
+        state["ppe_history"] = PPEHistory(history_size=5)
+        logger.info(f"Model selected: {data.model}, Target class: {data.target_class}")
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
+    return {"message": "Selection saved"}
+
+@sio.on("start_camera")
+async def start_camera(sid):
+    if state["is_running"]:
+        logger.warning("Camera already running")
+        return
+    state["cap"] = cv2.VideoCapture(0)
+    if not state["cap"].isOpened():
+        logger.error("Failed to open camera")
+        await sio.emit("error", {"message": "Failed to open camera"}, to=sid)
+        return
+    state["is_running"] = True
+    state["start_time"] = time.time()
+    state["frame_count"] = 0
+    state["ppe_stats"] = {"Accepted": 0, "Flagged": 0}
+    logger.info("Camera started")
+    asyncio.create_task(process_frames(sid))
+
+@sio.on("stop_camera")
+async def stop_camera(sid):
+    state["is_running"] = False
+    if state["cap"]:
+        state["cap"].release()
+        state["cap"] = None
+        logger.info("Camera stopped")
+    record_session_data()
+
+async def process_frames(sid):
+    while state["is_running"] and state["cap"]:
+        ret, frame = state["cap"].read()
+        if not ret:
+            logger.error("Failed to capture frame")
+            await sio.emit("error", {"message": "Failed to capture frame"}, to=sid)
+            break
+        frame, stats, status = process_frame(frame)
+        _, buffer = cv2.imencode(".jpg", frame)
+        frame_b64 = base64.b64encode(buffer).decode("utf-8")
+        session_duration = time.time() - state["start_time"]
+        hours, remainder = divmod(int(session_duration), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        session_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        await sio.emit("frame", {
+            "frame": frame_b64,
+            "stats": stats,
+            "sessionTime": session_time,
+            "status": status.capitalize()
+        }, to=sid)
+        state["frame_count"] += 1
+        await asyncio.sleep(0.033)
+
+def process_frame(frame):
+    face_rois, face_coords = detect_faces(frame)
+    stats = state["ppe_stats"]
+    status = "No status detected yet"
+    for face_roi, (x, y, w, h) in zip(face_rois, face_coords):
+        pil_img = Image.fromarray(cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB))
+        img_tensor = transform(pil_img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits, _ = state["model"](img_tensor)
+            if state["num_classes"] > 1:
+                probs = torch.sigmoid(logits).squeeze()
+                detected_items = [PPE_ITEMS[i] for i in range(len(probs)) if probs[i] >= DETECTION_CONFIDENCE_THRESHOLD]
+                confidence = max(probs.tolist()) if detected_items else 0.0
+            else:
+                prob = torch.sigmoid(logits.squeeze()).item()
+                detected = 1 if prob >= DETECTION_CONFIDENCE_THRESHOLD else 0
+                detected_items = [state["target_class"]] if detected else []
+                confidence = prob
+        if detected_items:
+            state["ppe_history"].add_ppe(detected_items, confidence)
+            status, acceptance_rate, flagged_items = state["ppe_history"].get_status(state["target_class"], state["num_classes"])
+            if status == "Accepted":
+                stats["Accepted"] += 1
+                color = PPE_COLORS[state["target_class"]] if state["num_classes"] == 1 else (0, 255, 0)
+            else:
+                stats["Flagged"] += 1
+                color = (0, 0, 255)
+            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+            status_text = f"{status}: {acceptance_rate:.1f}%"
+            if flagged_items:
+                status_text += f" | Missing: {', '.join(flagged_items)}"
+            cv2.putText(frame, status_text, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    return frame, stats, status
+
+def record_session_data():
+    if not state["start_time"] or state["frame_count"] == 0:
+        logger.info("No session data to record: start_time or frame_count is invalid")
+        return
+    try:
+        end_time = time.time()
+        session_duration = end_time - state["start_time"]
+        status, acceptance_rate, flagged_items = state["ppe_history"].get_status(state["target_class"], state["num_classes"])
+        session_date = datetime.now().strftime("%Y-%m-%d")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        with state["conn"].cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO sessions (employee_id, duration_seconds, status, target_class, session_date, timestamp)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+                """,
+                (state["user_id"], session_duration, status, state["target_class"], session_date, timestamp)
+            )
+            session_id = cur.fetchone()[0]
+            logger.info(f"Session recorded: ID {session_id}")
+            item = state["target_class"]
+            count = 1 if item in flagged_items else 0
+            percentage = 0.0 if count else 100.0
+            cur.execute(
+                """
+                INSERT INTO ppe_details (session_id, ppe_item, count, percentage, flagged)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (session_id, item, count, percentage, bool(count))
+            )
+            logger.info(f"PPE details recorded for session ID {session_id}")
+            state["conn"].commit()
+    except psycopg.Error as e:
+        logger.error(f"Database error in record_session_data: {e}")
+        state["conn"].rollback()
+        if "relation \"ppe_details\" does not exist" in str(e).lower():
+            logger.error("ppe_details table does not exist. Please create it manually.")
+    except Exception as e:
+        logger.error(f"Unexpected error in record_session_data: {e}")
+        state["conn"].rollback()
+
+@app.post("/upload_video")
+async def upload_video(file: UploadFile = File(...)):
+    if not file.content_type.startswith('video/'):
+        logger.warning("Invalid file type uploaded")
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video.")
+    max_file_size = 500 * 1024 * 1024
+    if file.size > max_file_size:
+        logger.warning(f"File size exceeds limit: {file.size} bytes")
+        raise HTTPException(status_code=400, detail="File size exceeds 500 MB limit")
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
+            temp_file_path = temp_file.name
+            logger.info(f"Writing video to temporary file: {temp_file_path}")
+            content = await file.read()
+            temp_file.write(content)
+            temp_file.flush()
+        logger.info("Opening video for processing")
+        cap = cv2.VideoCapture(temp_file_path)
+        if not cap.isOpened():
+            logger.error("Failed to open video file")
+            raise HTTPException(status_code=400, detail="Failed to open video file")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frames_to_process = min(total_frames, MAX_FRAMES_TO_PROCESS)
+        state["ppe_stats"] = {"Accepted": 0, "Flagged": 0}
+        state["ppe_history"] = PPEHistory(history_size=5)
+        frame_count = 0
+        state["start_time"] = time.time()
+        logger.info(f"Processing video: {frames_to_process}/{total_frames} frames")
+        while cap.isOpened() and frame_count < frames_to_process:
+            ret, frame = cap.read()
+            if not ret:
+                logger.info("End of video or read error")
+                break
+            frame, stats, status = process_frame(frame)
+            frame_count += 1
+            if frames_to_process < total_frames:
+                skip_frames = max(1, int(total_frames / frames_to_process) - 1)
+                for _ in range(skip_frames):
+                    cap.read()
+        cap.release()
+        logger.info(f"Video processing complete: {frame_count} frames processed")
+        record_session_data()
+        total = sum(state["ppe_stats"].values())
+        message = "Video Analysis Results:\n"
+        if total > 0:
+            for status, count in state["ppe_stats"].items():
+                percentage = (count / total) * 100
+                message += f"{status}: {percentage:.1f}%\n"
+        else:
+            message += "No PPE status detected in the video."
+        logger.info("Video analysis results prepared")
+        return {"message": message, "stats": state["ppe_stats"]}
+    except Exception as e:
+        logger.error(f"Error processing video upload: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing video: {str(e)}")
+    finally:
+        try:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+                logger.info(f"Temporary file removed: {temp_file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to remove temporary file {temp_file_path}: {e}")
+
+@app.get("/test_samples")
+async def test_samples():
+    test_dir = os.path.join(BASE_DIR, "test")
+    if not os.path.exists(test_dir):
+        logger.warning(f"Test directory not found: {test_dir}")
+        raise HTTPException(status_code=400, detail=f"Test data directory not found at {test_dir}")
+    num_samples = 10
+    image_files = [f for f in os.listdir(test_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
+    if len(image_files) < num_samples:
+        logger.warning(f"Not enough test images: found {len(image_files)}, need {num_samples}")
+        raise HTTPException(status_code=400, detail=f"Not enough test images. Found {len(image_files)}, need {num_samples}")
+    sample_indices = random.sample(range(len(image_files)), num_samples)
+    state["ppe_stats"] = {"Accepted": 0, "Flagged": 0}
+    state["ppe_history"] = PPEHistory(history_size=5)
+    samples = []
+    for idx in sample_indices:
+        img_path = os.path.join(test_dir, image_files[idx])
+        frame = cv2.imread(img_path)
+        if frame is None:
+            logger.warning(f"Failed to load image: {img_path}")
+            continue
+        frame, stats, status = process_frame(frame)
+        state["ppe_stats"] = stats
+        _, buffer = cv2.imencode(".jpg", frame)
+        img_b64 = base64.b64encode(buffer).decode("utf-8")
+        samples.append({
+            "image": img_b64,
+            "prediction": status,
+            "target_class": state["target_class"]
+        })
+    message = "Random Sample Results:\n"
+    total = sum(state["ppe_stats"].values())
+    if total > 0:
+        for status, count in state["ppe_stats"].items():
+            percentage = (count / total) * 100
+            message += f"{status}: {percentage:.1f}%\n"
+    else:
+        message += "No PPE status detected in the samples."
+    logger.info(f"Test samples completed: {message}")
+    record_session_data()
+    return {"message": message, "stats": state["ppe_stats"], "samples": samples}
+
+@app.get("/admin_stats")
+async def admin_stats(department: str = "All", date_range: str = "Last 7 Days"):
+    if department != "All" and department not in VALID_DEPTS:
+        logger.warning(f"Invalid department for admin stats: {department}")
+        raise HTTPException(status_code=400, detail="Invalid department")
+    if date_range not in ["Last 7 Days", "Last 30 Days", "All Time"]:
+        logger.warning(f"Invalid date range for admin stats: {date_range}")
+        raise HTTPException(status_code=400, detail="Invalid date range")
+    today = datetime.now().date()
+    if date_range == "Last 7 Days":
+        start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    elif date_range == "Last 30 Days":
+        start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    else:
+        start_date = "2000-01-01"
+    dept_condition = "" if department == "All" else f"AND e.department = %s"
+    try:
+        with state["conn"].cursor() as cur:
+            query_params = [start_date]
+            if dept_condition:
+                query_params.append(department)
+            cur.execute(
+                f"""
+                SELECT COALESCE(s.status, 'No Data') AS status, COALESCE(COUNT(*), 0) AS total
+                FROM sessions s
+                JOIN employees e ON s.employee_id = e.employee_id
+                WHERE s.session_date >= %s
+                {dept_condition}
+                GROUP BY s.status
+                """,
+                query_params
+            )
+            status_stats = cur.fetchall()
+            cur.execute(
+                f"""
+                SELECT e.employee_id, e.department, COALESCE(COUNT(s.id), 0) AS session_count,
+                       COALESCE(AVG(CASE WHEN s.status = 'Accepted' THEN 100.0 ELSE 0.0 END), 0.0) AS acceptance_rate,
+                       COALESCE(STRING_AGG(pd.ppe_item, ', '), 'None') AS flagged_items
+                FROM employees e
+                LEFT JOIN sessions s ON e.employee_id = s.employee_id AND s.session_date >= %s
+                LEFT JOIN ppe_details pd ON s.id = pd.session_id AND pd.flagged = TRUE
+                {dept_condition}
+                GROUP BY e.employee_id, e.department
+                ORDER BY session_count DESC
+                """,
+                query_params
+            )
+            employee_stats = cur.fetchall()
+        logger.info(f"Admin stats fetched: {len(status_stats)} status records, {len(employee_stats)} employee records")
+        return {
+            "compliance": [{"status": s[0], "total": s[1]} for s in status_stats] or [{"status": "No Data", "total": 0}],
+            "employees": [
+                {
+                    "employee_id": e[0],
+                    "department": e[1],
+                    "session_count": e[2],
+                    "acceptance_rate": float(e[3]),
+                    "flagged_items": e[4]
+                } for e in employee_stats
+            ]
+        }
+    except psycopg.Error as e:
+        logger.error(f"Database query error in admin_stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Database query error: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error in admin_stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+3)original code.py :
+
+
+import cv2
+import torch
+import torchvision.models as models
+import torchvision.transforms as transforms
+from PIL import Image
+import os
+import psycopg
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Device setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
+
+# Constants
+BASE_DIR = "C:\\PPE Detection Cuda\\FULL_RAPIDS_USE\\CLAUDE"
+MODEL_DIR = os.path.join(BASE_DIR, "models")
+PPE_ITEMS = [
+    "Hardhat", "NO-Hardhat", "Safety Vest", "NO-Safety Vest",
+    "Gloves", "NO-Gloves", "Goggles", "NO-Goggles",
+    "Mask", "NO-Mask", "Fall-Detected", "Person"
+]
+PPE_COLORS = {
+    "Hardhat": (0, 0, 255), "NO-Hardhat": (0, 128, 255),
+    "Safety Vest": (0, 255, 0), "NO-Safety Vest": (0, 128, 128),
+    "Gloves": (255, 0, 0), "NO-Gloves": (128, 0, 128),
+    "Goggles": (255, 255, 0), "NO-Goggles": (128, 128, 0),
+    "Mask": (0, 255, 255), "NO-Mask": (0, 128, 128),
+    "Fall-Detected": (255, 0, 255), "Person": (128, 0, 255)
+}
+VALID_DEPTS = ['Admin', 'Maintenance']
+MAX_FRAMES_TO_PROCESS = 100
+DETECTION_CONFIDENCE_THRESHOLD = 0.5
+DB_PARAMS = {
+    "dbname": "ppe_detection",
+    "user": "postgres",
+    "password": "Calcite*1234",
+    "host": "localhost",
+    "port": "5432"
+}
+
+# Image transform
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Model classes
+class EnhancedCustomCNN(torch.nn.Module):
+    def __init__(self, num_classes=12):
+        super(EnhancedCustomCNN, self).__init__()
+        self.features = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 32, kernel_size=3, padding=1), torch.nn.BatchNorm2d(32), torch.nn.ReLU(),
+            torch.nn.Conv2d(32, 32, kernel_size=3, padding=1), torch.nn.BatchNorm2d(32), torch.nn.ReLU(),
+            torch.nn.MaxPool2d(2, 2), torch.nn.Dropout2d(0.2),
+            torch.nn.Conv2d(32, 64, kernel_size=3, padding=1), torch.nn.BatchNorm2d(64), torch.nn.ReLU(),
+            torch.nn.Conv2d(64, 64, kernel_size=3, padding=1), torch.nn.BatchNorm2d(64), torch.nn.ReLU(),
+            torch.nn.MaxPool2d(2, 2), torch.nn.Dropout2d(0.2),
+            torch.nn.Conv2d(64, 128, kernel_size=3, padding=1), torch.nn.BatchNorm2d(128), torch.nn.ReLU(),
+            torch.nn.Conv2d(128, 128, kernel_size=3, padding=1), torch.nn.BatchNorm2d(128), torch.nn.ReLU(),
+            torch.nn.MaxPool2d(2, 2), torch.nn.Dropout2d(0.2),
+            torch.nn.Conv2d(128, 256, kernel_size=3, padding=1), torch.nn.BatchNorm2d(256), torch.nn.ReLU(),
+            torch.nn.Conv2d(256, 256, kernel_size=3, padding=1), torch.nn.BatchNorm2d(256), torch.nn.ReLU(),
+            torch.nn.MaxPool2d(2, 2), torch.nn.Dropout2d(0.2)
+        )
+        self.feature_size = 256 * (224 // 16) * (224 // 16)
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(self.feature_size, 512), torch.nn.ReLU(), torch.nn.Dropout(0.5),
+            torch.nn.Linear(512, 256), torch.nn.ReLU(), torch.nn.Dropout(0.5),
+            torch.nn.Linear(256, num_classes)
+        )
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        logits = self.classifier(x)
+        return logits, x
+
+class ModifiedResNet(torch.nn.Module):
+    def __init__(self, num_classes=1):
+        super(ModifiedResNet, self).__init__()
+        self.resnet = models.resnet18(weights="IMAGENET1K_V1")
+        self.feature_size = self.resnet.fc.in_features
+        self.resnet.fc = torch.nn.Identity()
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(self.feature_size, num_classes)
+        )
+    def forward(self, x):
+        features = self.resnet(x)
+        logits = self.classifier(features)
+        return logits, features
+
+class EfficientNetModel(torch.nn.Module):
+    def __init__(self, num_classes=1):
+        super(EfficientNetModel, self).__init__()
+        self.efficientnet = models.efficientnet_b0(weights='IMAGENET1K_V1')
+        self.feature_size = self.efficientnet.classifier[1].in_features
+        self.efficientnet.classifier = torch.nn.Identity()
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Dropout(0.3),
+            torch.nn.Linear(self.feature_size, num_classes)
+        )
+    def forward(self, x):
+        features = self.efficientnet(x)
+        logits = self.classifier(features)
+        return logits, features
+
+# Load model
+def load_model(model_name):
+    model_path = os.path.join(MODEL_DIR, f"{model_name}_best.pt")
+    try:
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        num_classes = None
+        if model_name == "CustomCNN":
+            if 'classifier.6.weight' in state_dict:
+                num_classes = state_dict['classifier.6.weight'].shape[0]
+            elif 'classifier.3.weight' in state_dict:
+                num_classes = state_dict['classifier.3.weight'].shape[0]
+            elif 'classifier.0.weight' in state_dict:
+                num_classes = state_dict['classifier.0.weight'].shape[0]
+        else:
+            if 'classifier.1.weight' in state_dict:
+                num_classes = state_dict['classifier.1.weight'].shape[0]
+            elif 'classifier.0.weight' in state_dict:
+                num_classes = state_dict['classifier.0.weight'].shape[0]
+        if num_classes is None:
+            logger.warning(f"Could not determine num_classes automatically from {model_name} checkpoint. Defaulting to {len(PPE_ITEMS)}")
+            num_classes = len(PPE_ITEMS)
+        if model_name == "CustomCNN":
+            model = EnhancedCustomCNN(num_classes=num_classes).to(device)
+        elif model_name == "ResNet18":
+            model = ModifiedResNet(num_classes=num_classes).to(device)
+        elif model_name == "EfficientNet":
+            model = EfficientNetModel(num_classes=num_classes).to(device)
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+        logger.info(f"{model_name} model loaded successfully from {model_path} with {num_classes} classes")
+        return model, num_classes
+    except (FileNotFoundError, KeyError, RuntimeError) as e:
+        logger.error(f"Error loading {model_name} from {model_path}: {e}")
+        raise Exception(f"Ensure the model file exists in {MODEL_DIR}")
+
+# Database functions
+def connect_db():
+    try:
+        conn = psycopg.connect(**DB_PARAMS)
+        logger.info("Database connected")
+        return conn
+    except psycopg.Error as e:
+        logger.error(f"Database connection failed: {e}")
+        raise Exception("Database connection failed")
+
+def init_database(conn):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS employees (
+                    employee_id VARCHAR(50) PRIMARY KEY,
+                    department VARCHAR(50) NOT NULL
+                )
+            """)
+            logger.info("Employees table created or already exists")
+            conn.commit()
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id SERIAL PRIMARY KEY,
+                    employee_id VARCHAR(50) REFERENCES employees(employee_id),
+                    duration_seconds FLOAT NOT NULL,
+                    status VARCHAR(20),
+                    target_class VARCHAR(50) NOT NULL,
+                    session_date DATE NOT NULL,
+                    timestamp TIME NOT NULL
+                )
+            """)
+            logger.info("Sessions table created or already exists")
+            conn.commit()
+
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='sessions' AND column_name='target_class'
+                    ) THEN
+                        ALTER TABLE sessions ADD COLUMN target_class VARCHAR(50) NOT NULL DEFAULT 'Hardhat';
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='sessions' AND column_name='status'
+                    ) THEN
+                        ALTER TABLE sessions ADD COLUMN status VARCHAR(20);
+                    END IF;
+                END;
+                $$;
+            """)
+            logger.info("Sessions table schema updated")
+            conn.commit()
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ppe_details (
+                    id SERIAL PRIMARY KEY,
+                    session_id INTEGER REFERENCES sessions(id),
+                    ppe_item VARCHAR(20) NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    percentage FLOAT NOT NULL DEFAULT 0.0,
+                    flagged BOOLEAN NOT NULL DEFAULT FALSE
+                )
+            """)
+            logger.info("ppe_details table created or already exists")
+            conn.commit()
+
+        logger.info("Database tables initialized successfully")
+    except psycopg.Error as e:
+        logger.error(f"Database initialization error: {e}")
+        conn.rollback()
+        raise Exception(f"Database initialization failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error during database initialization: {e}")
+        conn.rollback()
+        raise Exception(f"Unexpected error: {str(e)}")
+
+# PPE History class
+class PPEHistory:
+    def __init__(self, history_size=5):
+        self.history_size = history_size
+        self.ppe_history = []
+
+    def add_ppe(self, detected_items, confidence):
+        self.ppe_history.append((detected_items, confidence))
+        if len(self.ppe_history) > self.history_size:
+            self.ppe_history.pop(0)
+
+    def get_status(self, target_class, num_classes=1):
+        if not self.ppe_history:
+            return None, 0.0, []
+        accepted_count = 0
+        flagged_items = []
+        for detected_items, confidence in self.ppe_history:
+            if num_classes > 1:
+                if target_class in detected_items:
+                    accepted_count += 1
+                else:
+                    flagged_items.append(target_class)
+            else:
+                if confidence >= DETECTION_CONFIDENCE_THRESHOLD:
+                    accepted_count += 1
+                else:
+                    flagged_items.append(target_class)
+        total = len(self.ppe_history)
+        acceptance_rate = (accepted_count / total) * 100 if total > 0 else 0.0
+        return "Accepted" if acceptance_rate >= 50 else "Flagged", acceptance_rate, list(set(flagged_items))
+
+# Face detection
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+def detect_faces(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+    face_rois = []
+    face_coords = []
+    for (x, y, w, h) in faces:
+        face_img = frame[y:y+h, x:x+w]
+        face_rois.append(face_img)
+        face_coords.append((x, y, w, h))
+    return face_rois, face_coords
+
+
+
+ok so i have gone out of my way and created a more roubust plan and i am going to use data from multiple sources aprat for the 44000 images , 
+
+multiple training folders with 1000's more images only pertaining to a perticular class is going to be used 
+
+now say i have a folder with only 5000 hard hat images u will be able to tarain the model to detect no hardhat right cause i don't think i can get smaple data for no hardhar from other souces apart from the 44000 image dataset one i have fed u 
+
+similar case goes for safety vest and goggles , and gloves 
+
+also pls do remember any video or real time scenario will involve more than one ppe being used the model must not confuse and focus on all these components and only detect what was asked by user , for eg if worker in video stands with helmet and safety vest and user chose hardhat it should definitely pickup hardhat present and not hallucinate , similarly for all the other classes as well 
+
+there are if i am not mistaken 5 no classes so they must be handeled proerly using only the 44000 image datset 
+
+here are the files and their location : 
+
+(A) 44000 IMAGE : 
+
+Train : \\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\44000 IMAGES\train
+Valid : \\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\44000 IMAGES\valid
+
+Anotations :
+
+"\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\44000 IMAGES\train\_annotations.coco.json"
+
+"\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\44000 IMAGES\valid\_annotations.coco.json"
+
+
+(B) Gloves alone :
+
+train : \\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\GLOVES ALONE\train
+
+valid : \\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\GLOVES ALONE\valid
+ 
+anotation : 
+
+"\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\GLOVES ALONE\train\_annotations.coco.json"
+
+"\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\GLOVES ALONE\train\_annotations.coco.json"
+
+(C) Gloves alone :
+
+train : \\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\GOGGLES ALONE\train
+
+Valid :\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\GOGGLES ALONE\valid
+
+anotation :
+
+"\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\GOGGLES ALONE\train\_annotations.coco.json"
+
+
+"\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\GOGGLES ALONE\valid\_annotations.coco.json"
+
+(D) HARDHAT ALONE 
+
+Train : \\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\HARDHAT ALONE\train
+
+Valid: \\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\HARDHAT ALONE\valid
+
+Anotations :
+
+"\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\HARDHAT ALONE\train\_annotations.coco.json"
+
+"\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\HARDHAT ALONE\valid\_annotations.coco.json"
+
+
+(E) safety vest :
+
+Train :\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\SAFETY VEST ALONE\train
+
+Vaild : \\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\SAFETY VEST ALONE\valid
+
+anotaion :
+
+"\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\SAFETY VEST ALONE\train\_annotations.coco.json"
+
+"\\wsl.localhost\Ubuntu\root\PPE_Detection_Project\NEW_RAPIDS\SAFETY VEST ALONE\valid\_annotations.coco.json"
+
+now do note some files had errors so they didn't load pls do skip them if in case a file not exiting in the coco jason of the same
+
+
+Dude wtf did we discuss yestarday i asked u to test the samples directly form the datasets for which also i gave u all their paths to , and even the valid database of all 5 datasets 
+
+don't u fucking remeberi asked u to take 3 from the perticular chose class and 5 overall from other dataset not the 44000 one and the rest from the 44000 images one 
+ 

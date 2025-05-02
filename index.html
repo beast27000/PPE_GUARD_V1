@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PPE Detection System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4.7.5/dist/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.53.0/dist/apexcharts.min.js"></script>
+    <script>
+        // Fallback to local ApexCharts if CDN fails
+        if (typeof ApexCharts === 'undefined') {
+            document.write('<script src="/static/apexcharts.min.js"><\/script>');
+        }
+    </script>
+    <style>
+        body { font-family: Arial, sans-serif; }
+        .hidden { display: none; }
+        .dark { background-color: #1f2937; color: white; }
+        .dark .bg-white { background-color: #374151; }
+        .dark .bg-gray-200 { background-color: #4b5563; }
+        .dark .text-black { color: white; }
+        .progress-container { margin-top: 10px; }
+        .loading { color: #4b5563; font-style: italic; }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div id="login-screen" class="flex items-center justify-center min-h-screen">
+        <div class="bg-white p-8 rounded-lg shadow-lg w-full max-w-md">
+            <h1 class="text-2xl font-bold mb-6 text-center">PPE Detection System</h1>
+            <div class="mb-4">
+                <label class="block mb-2">Employee ID</label>
+                <input id="employee-id" type="text" class="w-full p-2 border rounded">
+            </div>
+            <div class="mb-4">
+                <label class="block mb-2">Department</label>
+                <select id="department" class="w-full p-2 border rounded">
+                    <option value="Admin">Admin</option>
+                    <option value="Maintenance">Maintenance</option>
+                </select>
+            </div>
+            <button onclick="handleLogin()" class="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-600 transition">Login</button>
+            <button onclick="showScreen('admin')" class="w-full mt-2 bg-gray-500 text-white p-2 rounded hover:bg-gray-600 transition">Admin Dashboard</button>
+        </div>
+    </div>
+
+    <div id="selection-screen" class="hidden flex items-center justify-center min-h-screen">
+        <div class="bg-white p-8 rounded-lg shadow-lg w-full max-w-md">
+            <h1 class="text-2xl font-bold mb-6 text-center">Select Detection Preferences</h1>
+            <div class="mb-4">
+                <label class="block mb-2">Target Class</label>
+                <select id="target-class" class="w-full p-2 border rounded">
+                    <option value="Hardhat">Hardhat</option>
+                    <option value="NO-Hardhat">NO-Hardhat</option>
+                    <option value="Safety Vest">Safety Vest</option>
+                    <option value="NO-Safety Vest">NO-Safety Vest</option>
+                    <option value="Gloves">Gloves</option>
+                    <option value="NO-Gloves">NO-Gloves</option>
+                    <option value="Goggles">Goggles</option>
+                    <option value="NO-Goggles">NO-Goggles</option>
+                    <option value="Mask">Mask</option>
+                    <option value="NO-Mask">NO-Mask</option>
+                    <option value="Fall-Detected">Fall-Detected</option>
+                    <option value="Person">Person</option>
+                </select>
+            </div>
+            <div class="mb-4">
+                <label class="block mb-2">Model</label>
+                <select id="model" class="w-full p-2 border rounded">
+                    <option value="CustomCNN">CustomCNN</option>
+                    <option value="ResNet18">ResNet18</option>
+                    <option value="EfficientNet">EfficientNet</option>
+                </select>
+            </div>
+            <button onclick="handleProceed()" class="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-600 transition">Proceed to Detection</button>
+            <button onclick="showScreen('login')" class="w-full mt-2 bg-gray-500 text-white p-2 rounded hover:bg-gray-600 transition">Back to Login</button>
+        </div>
+    </div>
+
+    <div id="main-screen" class="hidden container mx-auto p-4">
+        <div class="flex justify-between items-center mb-4">
+            <div id="user-info" class="text-black"></div>
+            <div class="flex items-center space-x-2">
+                <button id="theme-toggle" onclick="toggleTheme()" class="p-2 rounded bg-gray-200">🌙</button>
+                <button onclick="showScreen('login')" class="bg-red-500 text-white p-2 rounded hover:bg-red-600 transition">Logout</button>
+            </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="bg-white p-4 rounded-lg shadow">
+                <img id="video-feed" src="" alt="Video Feed" class="w-full h-auto hidden">
+                <div id="camera-off" class="flex items-center justify-center h-96 bg-black text-white">Camera Off</div>
+            </div>
+            <div class="bg-white p-4 rounded-lg shadow">
+                <h2 class="text-lg font-bold mb-2">Real-time PPE Stats</h2>
+                <div id="stats-chart"></div>
+                <p id="status" class="mt-4 font-bold">Status: No status detected yet</p>
+                <p id="session-time">Session Time: 00:00:00</p>
+            </div>
+        </div>
+        <div class="flex space-x-2 mt-4">
+            <button onclick="startCamera()" class="bg-green-500 text-white p-2 rounded hover:bg-green-600 transition">Start Camera</button>
+            <button onclick="stopCamera()" class="bg-red-500 text-white p-2 rounded hover:bg-red-600 transition">Stop Camera</button>
+            <label class="bg-blue-500 text-white p-2 rounded hover:bg-blue-600 transition cursor-pointer">
+                Upload Video
+                <input id="video-upload" type="file" accept="video/*" onchange="uploadVideo(event)" class="hidden">
+            </label>
+            <button onclick="testSamples()" class="bg-purple-500 text-white p-2 rounded hover:bg-purple-600 transition">Test Random Samples</button>
+        </div>
+    </div>
+
+    <div id="admin-screen" class="hidden container mx-auto p-4">
+        <div class="flex justify-between items-center mb-4">
+            <h1 class="text-2xl font-bold">Admin Dashboard</h1>
+            <button onclick="showScreen('login')" class="bg-gray-500 text-white p-2 rounded hover:bg-gray-600 transition">Back to Login</button>
+        </div>
+        <div class="bg-white p-4 rounded-lg shadow">
+            <div class="flex space-x-4 mb-4">
+                <div>
+                    <label class="block mb-2">Department</label>
+                    <select id="admin-dept" class="p-2 border rounded">
+                        <option value="All">All</option>
+                        <option value="Admin">Admin</option>
+                        <option value="Maintenance">Maintenance</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block mb-2">Date Range</label>
+                    <select id="admin-date" class="p-2 border rounded">
+                        <option value="Last 7 Days">Last 7 Days</option>
+                        <option value="Last 30 Days">Last 30 Days</option>
+                        <option value="All Time">All Time</option>
+                    </select>
+                </div>
+                <button onclick="fetchAdminStats()" class="bg-blue-500 text-white p-2 rounded hover:bg-blue-600 transition">Apply Filters</button>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <h2 class="text-lg font-bold">Compliance Trends</h2>
+                    <div id="compliance-chart"></div>
+                </div>
+                <div>
+                    <h2 class="text-lg font-bold">Acceptance Rate Trend</h2>
+                    <div id="acceptance-chart"></div>
+                </div>
+            </div>
+            <div class="mt-4">
+                <h2 class="text-lg font-bold">Employee Details</h2>
+                <p id="admin-loading" class="loading hidden">Loading...</p>
+                <table class="w-full border-collapse">
+                    <thead>
+                        <tr class="bg-gray-200">
+                            <th class="border p-2">Employee ID</th>
+                            <th class="border p-2">Department</th>
+                            <th class="border p-2">Sessions</th>
+                            <th class="border p-2">Acceptance Rate</th>
+                            <th class="border p-2">Flagged Items</th>
+                        </tr>
+                    </thead>
+                    <tbody id="employee-table"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io('http://localhost:8000');
+        let statsChart, complianceChart, acceptanceChart;
+        let isDark = false;
+
+        socket.on('frame', (data) => {
+            document.getElementById('video-feed').src = `data:image/jpeg;base64,${data.frame}`;
+            document.getElementById('video-feed').classList.remove('hidden');
+            document.getElementById('camera-off').classList.add('hidden');
+            updateStatsChart(data.stats, document.getElementById('target-class').value);
+            document.getElementById('status').textContent = `Status: ${data.status}`;
+            document.getElementById('session-time').textContent = `Session Time: ${data.sessionTime}`;
+        });
+
+        socket.on('error', (data) => {
+            alert(data.message);
+        });
+
+        function showScreen(screen) {
+            document.querySelectorAll('#login-screen, #selection-screen, #main-screen, #admin-screen').forEach(el => el.classList.add('hidden'));
+            document.getElementById(`${screen}-screen`).classList.remove('hidden');
+        }
+
+        function toggleTheme() {
+            isDark = !isDark;
+            document.body.classList.toggle('dark');
+            document.getElementById('theme-toggle').textContent = isDark ? '☀️' : '🌙';
+        }
+
+        async function handleLogin() {
+            const employeeId = document.getElementById('employee-id').value.trim();
+            const department = document.getElementById('department').value;
+            if (!employeeId) {
+                alert('Please enter your Employee ID');
+                return;
+            }
+            if (!['Admin', 'Maintenance'].includes(department)) {
+                alert('Please select a valid department');
+                return;
+            }
+            try {
+                await axios.post('http://localhost:8000/login', { employee_id: employeeId, department });
+                document.getElementById('user-info').textContent = `Employee ID: ${employeeId} | Department: ${department} | Target: ${document.getElementById('target-class').value} | Model: ${document.getElementById('model').value}`;
+                showScreen('selection');
+            } catch (error) {
+                console.error('Login error:', error);
+                alert(`Login failed: ${error.response?.data?.detail || error.message}`);
+            }
+        }
+
+        async function handleProceed() {
+            const targetClass = document.getElementById('target-class').value;
+            const model = document.getElementById('model').value;
+            try {
+                await axios.post('http://localhost:8000/select', { target_class: targetClass, model });
+                document.getElementById('user-info').textContent = `Employee ID: ${document.getElementById('employee-id').value} | Department: ${document.getElementById('department').value} | Target: ${targetClass} | Model: ${model}`;
+                showScreen('main');
+            } catch (error) {
+                console.error('Proceed error:', error);
+                alert(`Failed to proceed: ${error.response?.data?.detail || error.message}`);
+            }
+        }
+
+        function startCamera() {
+            socket.emit('start_camera');
+        }
+
+        function stopCamera() {
+            socket.emit('stop_camera');
+            document.getElementById('video-feed').classList.add('hidden');
+            document.getElementById('camera-off').classList.remove('hidden');
+        }
+
+        async function uploadVideo(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const progressBar = document.createElement('div');
+            progressBar.className = 'w-full bg-gray-200 rounded progress-container';
+            progressBar.innerHTML = '<div id="progress" class="bg-blue-500 h-4 rounded" style="width: 0%"></div>';
+            document.getElementById('main-screen').appendChild(progressBar);
+            const formData = new FormData();
+            formData.append('file', file);
+            try {
+                const response = await axios.post('http://localhost:8000/upload_video', formData, {
+                    headers: { 'Content-Type': 'multipart/form-data' },
+                    timeout: 300000,
+                    onUploadProgress: (progressEvent) => {
+                        const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+                        document.getElementById('progress').style.width = `${percentCompleted}%`;
+                    }
+                });
+                alert(response.data.message);
+                updateStatsChart(response.data.stats, document.getElementById('target-class').value);
+            } catch (error) {
+                console.error('Video upload error:', error);
+                let errorMessage = 'Video upload failed';
+                if (error.response) {
+                    errorMessage += `: ${error.response.data.detail || error.response.statusText}`;
+                } else if (error.request) {
+                    errorMessage += ': No response from server';
+                } else {
+                    errorMessage += `: ${error.message}`;
+                }
+                alert(errorMessage);
+            } finally {
+                progressBar.remove();
+            }
+        }
+
+        async function testSamples() {
+            try {
+                const response = await axios.get('http://localhost:8000/test_samples');
+                alert(response.data.message);
+                updateStatsChart(response.data.stats, document.getElementById('target-class').value);
+            } catch (error) {
+                console.error('Test samples error:', error);
+                alert(`Test failed: ${error.response?.data?.detail || error.message}`);
+            }
+        }
+
+        function updateStatsChart(stats, targetClass) {
+            if (typeof ApexCharts === 'undefined') {
+                console.error('ApexCharts is not loaded');
+                alert('Failed to update stats chart: ApexCharts library is not loaded. Please ensure apexcharts.min.js is in the static folder or check your internet connection.');
+                return;
+            }
+            try {
+                const labels = Object.keys(stats).filter(k => stats[k] > 0);
+                const data = Object.values(stats).filter(v => v > 0);
+                const options = {
+                    chart: {
+                        type: 'pie',
+                        height: 350
+                    },
+                    series: data.length ? data : [1],
+                    labels: labels.length ? labels : ['No Data'],
+                    colors: labels.map(l => l === 'Accepted' ? '#00FF00' : '#FF0000'),
+                    title: {
+                        text: `PPE Compliance (${targetClass})`,
+                        align: 'center'
+                    },
+                    legend: {
+                        position: 'top'
+                    },
+                    noData: {
+                        text: 'No Data Available'
+                    }
+                };
+                if (statsChart) {
+                    statsChart.destroy();
+                }
+                statsChart = new ApexCharts(document.querySelector('#stats-chart'), options);
+                statsChart.render();
+            } catch (error) {
+                console.error('Error updating stats chart:', error);
+                alert('Failed to update stats chart: ' + error.message);
+            }
+        }
+
+        async function fetchAdminStats() {
+            const dept = document.getElementById('admin-dept').value;
+            const dateRange = document.getElementById('admin-date').value;
+            const loading = document.getElementById('admin-loading');
+            loading.classList.remove('hidden');
+            try {
+                const response = await axios.get('http://localhost:8000/admin_stats', {
+                    params: { department: dept, date_range: dateRange },
+                    timeout: 10000
+                });
+                const { compliance, employees } = response.data;
+
+                // Compliance Chart (Pie)
+                const complianceLabels = compliance.map(c => c.status).filter((_, i) => compliance[i].total > 0);
+                const complianceData = compliance.map(c => c.total).filter(t => t > 0);
+                const complianceOptions = {
+                    chart: {
+                        type: 'pie',
+                        height: 350
+                    },
+                    series: complianceData.length ? complianceData : [1],
+                    labels: complianceLabels.length ? complianceLabels : ['No Data'],
+                    colors: complianceLabels.map(l => l === 'Accepted' ? '#00FF00' : l === 'Flagged' ? '#FF0000' : '#CCCCCC'),
+                    title: {
+                        text: 'Compliance Trends',
+                        align: 'center'
+                    },
+                    legend: {
+                        show: !!complianceLabels.length,
+                        position: 'top'
+                    },
+                    noData: {
+                        text: 'No Data Available'
+                    }
+                };
+                if (complianceChart) {
+                    complianceChart.destroy();
+                }
+                complianceChart = new ApexCharts(document.querySelector('#compliance-chart'), complianceOptions);
+                complianceChart.render();
+
+                // Acceptance Rate Chart (Bar)
+                const empLabels = employees.filter(e => e.session_count > 0).map(e => e.employee_id);
+                const empData = employees.filter(e => e.session_count > 0).map(e => e.acceptance_rate);
+                const acceptanceOptions = {
+                    chart: {
+                        type: 'bar',
+                        height: 350
+                    },
+                    series: [{
+                        name: 'Acceptance Rate',
+                        data: empData.length ? empData : [0]
+                    }],
+                    xaxis: {
+                        categories: empLabels.length ? empLabels : ['No Data']
+                    },
+                    title: {
+                        text: 'Acceptance Rate Trend',
+                        align: 'center'
+                    },
+                    yaxis: {
+                        min: 0,
+                        max: 100
+                    },
+                    colors: ['#00FF00'],
+                    noData: {
+                        text: 'No Data Available'
+                    }
+                };
+                if (acceptanceChart) {
+                    acceptanceChart.destroy();
+                }
+                acceptanceChart = new ApexCharts(document.querySelector('#acceptance-chart'), acceptanceOptions);
+                acceptanceChart.render();
+
+                // Employee Table
+                const tableBody = document.getElementById('employee-table');
+                tableBody.innerHTML = employees.length ? employees.map(emp => `
+                    <tr class="hover:bg-gray-100">
+                        <td class="border p-2">${emp.employee_id}</td>
+                        <td class="border p-2">${emp.department}</td>
+                        <td class="border p-2">${emp.session_count}</td>
+                        <td class="border p-2">${emp.acceptance_rate.toFixed(1)}</td>
+                        <td class="border p-2">${emp.flagged_items || 'None'}</td>
+                    </tr>
+                `).join('') : '<tr><td colspan="5" class="border p-2 text-center">No employee data</td></tr>';
+            } catch (error) {
+                console.error('Admin stats error:', error);
+                alert(`Failed to fetch admin stats: ${error.response?.data?.detail || error.message}`);
+                document.getElementById('employee-table').innerHTML = '<tr><td colspan="5" class="border p-2 text-center">Error loading data</td></tr>';
+            } finally {
+                loading.classList.add('hidden');
+            }
+        }
+
+        console.log('ApexCharts loading status:', typeof ApexCharts !== 'undefined' ? 'Loaded' : 'Not loaded');
+    </script>
+</body>
+</html>

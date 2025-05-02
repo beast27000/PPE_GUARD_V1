@@ -1,0 +1,9 @@
+fastapi==0.115.2
+uvicorn==0.32.0
+python-socketio==5.11.4
+psycopg==3.2.3
+opencv-python==4.10.0.84
+torch==2.4.1
+torchvision==0.19.1
+Pillow==10.4.0
+numpy==2.1.1

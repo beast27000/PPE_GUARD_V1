@@ -1,0 +1,23 @@
+hey go line by line for the following code i am posting and i neeed many many things from it
+,in details pls remeber 
+
+1	INTRODUCTION									1
+Introduction to Project								2
+Problem Statement							            	3
+ Motivation										4
+Sustainable Development Goal of the Project					5
+2	LITERATURE SURVEY								6
+	2.1 Overview of the Research Area								7
+	2.2 Existing Models and Frameworks							8
+	2.3 Limitations Identified from Literature Survey (Research Gaps)			11
+      2.4 Research Objectives									12
+	2.5 Product Backlog (Key user stories with Desired outcomes)			   	13
+      2.5 Plan of Action (Project Road Map)                                                                              15
+	
+3. SPRINT PLANNING AND EXECUTION METHODOLOGY			21
+	3.1 SPRINT I										21
+		3.1.1 Objectives with user stories of Sprint I						23
+		3.1.2 Functional Document								25
+		3.1.3 Architecture Document								28
+		3.1.4 Outcome of Objectives/Result Analysis						29
+		3.1.5 Sprint Retrospective			
